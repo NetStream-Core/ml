@@ -1,0 +1,13 @@
+pre-commit:
+  commands:
+    formatting:
+      run: just format
+      stage_fixed: true
+
+    linting:
+      run: just lint
+
+pre-push:
+  commands:
+    testing:
+      run: just test
