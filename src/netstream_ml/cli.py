@@ -1,11 +1,29 @@
 import argparse
+import json
 import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+import polars as pl
+
 from netstream_ml import __version__
+from netstream_ml.baselines import (
+    evaluate_baseline,
+    evaluate_baseline_by_scenario,
+    fit_threshold_baseline,
+)
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
+from netstream_ml.features import WindowSpec, build_features
+from netstream_ml.split import (
+    SplitConfig,
+    SplitRatios,
+    add_split_column,
+    check_run_leakage,
+    run_ids_by_scenario,
+    run_splits,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +64,61 @@ def build_parser() -> argparse.ArgumentParser:
         "window per row and can need more than the server's default",
     )
 
+    split = data_subparsers.add_parser(
+        "split",
+        help="assign train/val/test splits to a dataset without leaking a run across them",
+    )
+    split.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `data export` (flows.parquet, dns.parquet, labels.parquet)",
+    )
+    split.add_argument("--seed", type=int, default=0)
+    split.add_argument("--train", type=float, default=0.6)
+    split.add_argument("--val", type=float, default=0.2)
+    split.add_argument("--test", type=float, default=0.2)
+
+    features = subparsers.add_parser(
+        "features", help="build windowed features for training or evaluation"
+    )
+    features_subparsers = features.add_subparsers(dest="features_command")
+
+    build = features_subparsers.add_parser(
+        "build", help="aggregate flows and DNS queries into per-source, per-window features"
+    )
+    build.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `data export` (flows.parquet, dns.parquet)",
+    )
+    build.add_argument(
+        "--window",
+        dest="windows",
+        type=int,
+        action="append",
+        default=None,
+        help="window size in seconds; repeat for more than one (default: 1, 5, 10)",
+    )
+
+    baseline = subparsers.add_parser("baseline", help="fit and evaluate baseline detectors")
+    baseline_subparsers = baseline.add_subparsers(dest="baseline_command")
+
+    threshold = baseline_subparsers.add_parser(
+        "threshold", help="a per-feature threshold rule, fit on the training split"
+    )
+    threshold.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    threshold.add_argument("--window", type=int, default=5, help="window size in seconds")
+    threshold.add_argument(
+        "--target-fpr",
+        type=float,
+        default=0.01,
+        help="each feature's threshold false-alarms on about this share of training benign traffic",
+    )
+
     return parser
 
 
@@ -62,6 +135,116 @@ def _run_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_split(args: argparse.Namespace) -> int:
+    ratios = SplitRatios(train=args.train, val=args.val, test=args.test)
+    labels = pl.read_parquet(args.dataset_dir / "labels.parquet")
+    assignment = run_splits(run_ids_by_scenario(labels), seed=args.seed, ratios=ratios)
+
+    config = SplitConfig(seed=args.seed, ratios=ratios)
+    reports: dict[str, object] = {}
+    ok = True
+    for name in ("flows", "dns"):
+        path = args.dataset_dir / f"{name}.parquet"
+        frame = add_split_column(pl.read_parquet(path), assignment, config)
+        frame.write_parquet(path)
+        report = check_run_leakage(frame)
+        reports[name] = {
+            "split_counts": report.split_counts,
+            "leaking_run_ids": report.leaking_run_ids,
+        }
+        ok = ok and report.ok
+
+    manifest_path = args.dataset_dir / "split_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "seed": args.seed,
+                "ratios": {"train": ratios.train, "val": ratios.val, "test": ratios.test},
+                "run_assignment": assignment,
+                "reports": reports,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"split manifest written to {manifest_path}")
+
+    if not ok:
+        print("leakage detected: some run_id appears in more than one split", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_features_build(args: argparse.Namespace) -> int:
+    windows = args.windows or [1, 5, 10]
+    flows = pl.read_parquet(args.dataset_dir / "flows.parquet")
+    dns = pl.read_parquet(args.dataset_dir / "dns.parquet")
+
+    built: dict[str, object] = {}
+    for seconds in windows:
+        window = WindowSpec(seconds)
+        table = build_features(flows, dns, window)
+        out_path = args.dataset_dir / f"features_w{seconds}.parquet"
+        table.write_parquet(out_path)
+        built[out_path.name] = table.height
+        print(f"{out_path}: {table.height} rows")
+
+    manifest_path = args.dataset_dir / "features_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"windows_seconds": windows, "files": built}, indent=2) + "\n"
+    )
+    print(f"features manifest written to {manifest_path}")
+    return 0
+
+
+def _run_baseline_threshold(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    model = fit_threshold_baseline(train, target_fpr=args.target_fpr)
+
+    metrics_by_split: dict[str, object] = {}
+    for split_name in ("train", "val", "test"):
+        subset = frame.filter(pl.col("split") == split_name)
+        if subset.height == 0:
+            continue
+        metrics = evaluate_baseline(model, subset)
+        metrics_by_split[split_name] = metrics.to_dict()
+        print(
+            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
+            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
+        )
+
+    test = frame.filter(pl.col("split") == "test")
+    by_scenario = (
+        {
+            scenario: metrics.to_dict()
+            for scenario, metrics in evaluate_baseline_by_scenario(model, test).items()
+        }
+        if test.height > 0
+        else {}
+    )
+
+    result = {
+        "window_seconds": args.window,
+        "target_fpr": args.target_fpr,
+        "rules": model.to_dict(),
+        "metrics_by_split": metrics_by_split,
+        "test_metrics_by_scenario": by_scenario,
+    }
+    out_path = args.dataset_dir / f"baseline_threshold_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"baseline report written to {out_path}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -72,6 +255,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "data" and args.data_command == "export":
         return _run_export(args)
+    if args.command == "data" and args.data_command == "split":
+        return _run_split(args)
+    if args.command == "features" and args.features_command == "build":
+        return _run_features_build(args)
+    if args.command == "baseline" and args.baseline_command == "threshold":
+        return _run_baseline_threshold(args)
 
     parser.print_help()
     return 2
