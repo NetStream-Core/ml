@@ -30,6 +30,12 @@ from netstream_ml.split import (
     run_ids_by_scenario,
     run_splits,
 )
+from netstream_ml.supervised import (
+    evaluate_random_forest,
+    evaluate_random_forest_by_scenario,
+    fit_random_forest,
+    tune_random_forest,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,6 +149,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     isolation_forest.add_argument("--n-estimators", type=int, default=100)
     isolation_forest.add_argument("--random-state", type=int, default=0)
+
+    random_forest = baseline_subparsers.add_parser(
+        "random-forest",
+        help="a Random Forest fit on labelled attack and benign windows, tuned on validation",
+    )
+    random_forest.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
+    random_forest.add_argument("--random-state", type=int, default=0)
 
     return parser
 
@@ -323,12 +341,68 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_baseline_random_forest(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    val = frame.filter(pl.col("split") == "val")
+    tuning = tune_random_forest(train, val, random_state=args.random_state)
+    model = fit_random_forest(train, tuning.config)
+    print(
+        f"tuned: n_estimators={tuning.config.n_estimators} max_depth={tuning.config.max_depth} "
+        f"class_weight={tuning.config.class_weight} (val f1={tuning.val_metrics.f1:.3f}, "
+        f"{tuning.candidates_tried} candidates)"
+    )
+
+    metrics_by_split: dict[str, object] = {}
+    for split_name in ("train", "val", "test"):
+        subset = frame.filter(pl.col("split") == split_name)
+        if subset.height == 0:
+            continue
+        metrics = evaluate_random_forest(model, subset)
+        metrics_by_split[split_name] = metrics.to_dict()
+        print(
+            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
+            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
+        )
+
+    test = frame.filter(pl.col("split") == "test")
+    by_scenario = (
+        {
+            scenario: metrics.to_dict()
+            for scenario, metrics in evaluate_random_forest_by_scenario(model, test).items()
+        }
+        if test.height > 0
+        else {}
+    )
+
+    result = {
+        "window_seconds": args.window,
+        "tuning": tuning.to_dict(),
+        "model": model.to_dict(),
+        "metrics_by_split": metrics_by_split,
+        "test_metrics_by_scenario": by_scenario,
+    }
+    out_path = args.dataset_dir / f"random_forest_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"random forest report written to {out_path}")
+    return 0
+
+
 _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("data", "export"): _run_export,
     ("data", "split"): _run_split,
     ("features", "build"): _run_features_build,
     ("baseline", "threshold"): _run_baseline_threshold,
     ("baseline", "isolation-forest"): _run_baseline_isolation_forest,
+    ("baseline", "random-forest"): _run_baseline_random_forest,
 }
 
 _SUBCOMMAND_ATTR = {
