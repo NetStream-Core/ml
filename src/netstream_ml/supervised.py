@@ -57,6 +57,12 @@ class RandomForestBaseline:
         raw = self.model.predict(matrix)
         return pl.Series("predicted", raw.astype(bool))
 
+    def decision_score(self, frame: pl.DataFrame) -> pl.Series:
+        """The model's predicted probability of the attack (`True`) class."""
+        matrix = _to_matrix(frame, self.features)
+        attack_index = list(self.model.classes_).index(True)
+        return pl.Series("score", self.model.predict_proba(matrix)[:, attack_index])
+
     def to_dict(self) -> dict[str, object]:
         return {
             "features": list(self.features),
