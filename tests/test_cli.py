@@ -328,3 +328,40 @@ def test_baseline_random_forest_fails_clearly_without_a_split_column(tmp_path: P
     exit_code = main(["baseline", "random-forest", str(tmp_path)])
 
     assert exit_code == 1
+
+
+def test_evaluate_compare_writes_a_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+
+    exit_code = main(["evaluate", "compare", str(tmp_path), "--window", "5", "--seeds", "0", "1"])
+
+    assert exit_code == 0
+    report = json.loads((tmp_path / "evaluate_compare_w5.json").read_text())
+    assert report["window_seconds"] == 5
+    assert report["threshold"]["precision_recall_curve"]["average_precision"] > 0
+    assert len(report["isolation_forest"]["seed_sensitivity"]["values"]) == 2
+    assert len(report["random_forest"]["seed_sensitivity"]["values"]) == 2
+    assert "candidates_tried" in report["random_forest"]["tuning"]
+    assert "threshold_vs_isolation_forest" in report["mcnemar"]
+    assert "threshold_vs_random_forest" in report["mcnemar"]
+    assert "isolation_forest_vs_random_forest" in report["mcnemar"]
+    out = capsys.readouterr().out
+    assert "average_precision" in out
+    assert "comparison report written to" in out
+
+
+def test_evaluate_compare_fails_clearly_without_test_rows(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "packets_total": [1, 2, 3],
+            "label": ["benign", "benign", "benign"],
+            "split": ["train", "train", "val"],
+        }
+    ).write_parquet(tmp_path / "features_w5.parquet")
+
+    exit_code = main(["evaluate", "compare", str(tmp_path)])
+
+    assert exit_code == 1

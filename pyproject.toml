@@ -9,6 +9,7 @@ dependencies = [
     "polars>=1.18",
     "scikit-learn>=1.5",
     "numpy>=2.0",
+    "scipy>=1.14",
 ]
 
 [project.scripts]
@@ -46,4 +47,8 @@ files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = "sklearn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "scipy.*"
 ignore_missing_imports = true

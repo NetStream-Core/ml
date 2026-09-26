@@ -49,6 +49,12 @@ class IsolationForestBaseline:
         raw = self.model.predict(matrix)
         return pl.Series("predicted", raw == -1)
 
+    def decision_score(self, frame: pl.DataFrame) -> pl.Series:
+        """Higher means more attack-like. `decision_function` is the
+        opposite convention (higher means more normal), so this negates it."""
+        matrix = _to_matrix(frame, self.features)
+        return pl.Series("score", -self.model.decision_function(matrix))
+
     def to_dict(self) -> dict[str, object]:
         return {
             "features": list(self.features),

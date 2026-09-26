@@ -21,6 +21,7 @@ from netstream_ml.baselines import (
 )
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
+from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.features import WindowSpec, build_features
 from netstream_ml.split import (
     SplitConfig,
@@ -31,6 +32,7 @@ from netstream_ml.split import (
     run_splits,
 )
 from netstream_ml.supervised import (
+    RandomForestConfig,
     evaluate_random_forest,
     evaluate_random_forest_by_scenario,
     fit_random_forest,
@@ -161,6 +163,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
     random_forest.add_argument("--random-state", type=int, default=0)
+
+    evaluate = subparsers.add_parser(
+        "evaluate", help="model-agnostic evaluation tools (PR curves, seed spread, significance)"
+    )
+    evaluate_subparsers = evaluate.add_subparsers(dest="evaluate_command")
+
+    compare = evaluate_subparsers.add_parser(
+        "compare",
+        help="compare the threshold, Isolation Forest and Random Forest baselines: PR "
+        "curves, seed sensitivity, and pairwise significance tests on the same test rows",
+    )
+    compare.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    compare.add_argument("--window", type=int, default=5, help="window size in seconds")
+    compare.add_argument("--target-fpr", type=float, default=0.01)
+    compare.add_argument("--contamination", type=float, default=0.01)
+    compare.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 3, 4],
+        help="random seeds to refit the Isolation Forest and Random Forest under",
+    )
 
     return parser
 
@@ -396,6 +424,110 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_evaluate_compare(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    val = frame.filter(pl.col("split") == "val")
+    test = frame.filter(pl.col("split") == "test")
+    if test.height == 0:
+        print(f"{path} has no test rows to compare on", file=sys.stderr)
+        return 1
+    y_test = test["label"] != "benign"
+
+    threshold_model = fit_threshold_baseline(train, target_fpr=args.target_fpr)
+    threshold_pred = threshold_model.predict(test)
+    threshold_curve = precision_recall_curve(y_test, threshold_model.decision_score(test))
+
+    iso_config = IsolationForestConfig(contamination=args.contamination)
+    iso_model = fit_isolation_forest(train, iso_config)
+    iso_pred = iso_model.predict(test)
+    iso_curve = precision_recall_curve(y_test, iso_model.decision_score(test))
+    iso_seeds = seed_sensitivity(
+        lambda seed: evaluate_isolation_forest(
+            fit_isolation_forest(
+                train, IsolationForestConfig(contamination=args.contamination, random_state=seed)
+            ),
+            test,
+        ),
+        seeds=args.seeds,
+    )
+
+    rf_tuning = tune_random_forest(train, val, random_state=args.seeds[0])
+    rf_model = fit_random_forest(train, rf_tuning.config)
+    rf_pred = rf_model.predict(test)
+    rf_curve = precision_recall_curve(y_test, rf_model.decision_score(test))
+    rf_seeds = seed_sensitivity(
+        lambda seed: evaluate_random_forest(
+            fit_random_forest(
+                train,
+                RandomForestConfig(
+                    n_estimators=rf_tuning.config.n_estimators,
+                    max_depth=rf_tuning.config.max_depth,
+                    class_weight=rf_tuning.config.class_weight,
+                    random_state=seed,
+                ),
+            ),
+            test,
+        ),
+        seeds=args.seeds,
+    )
+
+    threshold_vs_iso = mcnemar_test(y_test, threshold_pred, iso_pred)
+    threshold_vs_rf = mcnemar_test(y_test, threshold_pred, rf_pred)
+    iso_vs_rf = mcnemar_test(y_test, iso_pred, rf_pred)
+
+    print(
+        f"average_precision: threshold={threshold_curve.average_precision:.3f} "
+        f"isolation-forest={iso_curve.average_precision:.3f} "
+        f"random-forest={rf_curve.average_precision:.3f}"
+    )
+    print(
+        f"F1 across seeds {list(args.seeds)}: "
+        f"isolation-forest mean={iso_seeds.mean:.3f} std={iso_seeds.std:.3f}; "
+        f"random-forest mean={rf_seeds.mean:.3f} std={rf_seeds.std:.3f}"
+    )
+    print(
+        f"threshold vs isolation-forest: p={threshold_vs_iso.p_value:.4f}; "
+        f"threshold vs random-forest: p={threshold_vs_rf.p_value:.4f}; "
+        f"isolation-forest vs random-forest: p={iso_vs_rf.p_value:.4f}"
+    )
+
+    result = {
+        "window_seconds": args.window,
+        "threshold": {
+            "target_fpr": args.target_fpr,
+            "precision_recall_curve": threshold_curve.to_dict(),
+        },
+        "isolation_forest": {
+            "contamination": args.contamination,
+            "precision_recall_curve": iso_curve.to_dict(),
+            "seed_sensitivity": iso_seeds.to_dict(),
+        },
+        "random_forest": {
+            "tuning": rf_tuning.to_dict(),
+            "precision_recall_curve": rf_curve.to_dict(),
+            "seed_sensitivity": rf_seeds.to_dict(),
+        },
+        "mcnemar": {
+            "threshold_vs_isolation_forest": threshold_vs_iso.to_dict(),
+            "threshold_vs_random_forest": threshold_vs_rf.to_dict(),
+            "isolation_forest_vs_random_forest": iso_vs_rf.to_dict(),
+        },
+    }
+    out_path = args.dataset_dir / f"evaluate_compare_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"comparison report written to {out_path}")
+    return 0
+
+
 _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("data", "export"): _run_export,
     ("data", "split"): _run_split,
@@ -403,12 +535,14 @@ _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("baseline", "threshold"): _run_baseline_threshold,
     ("baseline", "isolation-forest"): _run_baseline_isolation_forest,
     ("baseline", "random-forest"): _run_baseline_random_forest,
+    ("evaluate", "compare"): _run_evaluate_compare,
 }
 
 _SUBCOMMAND_ATTR = {
     "data": "data_command",
     "features": "features_command",
     "baseline": "baseline_command",
+    "evaluate": "evaluate_command",
 }
 
 

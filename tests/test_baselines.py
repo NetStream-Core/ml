@@ -86,6 +86,34 @@ def test_baseline_predicts_true_if_any_rule_fires() -> None:
     assert baseline.predict(frame).to_list() == [True, True, False]
 
 
+def test_threshold_rule_excess_is_zero_at_the_threshold_and_grows_past_it() -> None:
+    frame = pl.DataFrame({"x": [5.0, 10.0, 15.0]})
+    rule = baselines.ThresholdRule("x", 10.0, direction="above")
+    excess = rule.excess(frame).to_list()
+    assert excess[1] == pytest.approx(0.0)
+    assert excess[0] < excess[1] < excess[2]
+
+
+def test_baseline_with_no_rules_scores_everything_at_zero() -> None:
+    baseline = baselines.ThresholdBaseline(())
+    frame = pl.DataFrame({"x": [1, 2, 3]})
+    assert baseline.decision_score(frame).to_list() == [0.0, 0.0, 0.0]
+
+
+def test_decision_score_takes_the_largest_excess_across_rules() -> None:
+    frame = pl.DataFrame({"a": [20.0, 0.0], "b": [0.0, 20.0]})
+    baseline = baselines.ThresholdBaseline(
+        (
+            baselines.ThresholdRule("a", 10.0),
+            baselines.ThresholdRule("b", 10.0),
+        )
+    )
+    scores = baseline.decision_score(frame).to_list()
+    assert scores[0] > 0
+    assert scores[1] > 0
+    assert scores[0] == pytest.approx(scores[1])
+
+
 def test_evaluate_predictions_computes_standard_metrics() -> None:
     y_true = pl.Series([True, True, False, False])
     y_pred = pl.Series([True, False, True, False])
