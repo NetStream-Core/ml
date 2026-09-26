@@ -123,6 +123,7 @@ def flow_window_features(frame: pl.DataFrame, window: WindowSpec) -> pl.DataFram
         for c in SIZE_BIN_COLUMNS
     ]
     carry_split = [pl.col("split").last()] if "split" in frame.columns else []
+    carry_run_id = [pl.col("run_id").last()] if "run_id" in frame.columns else []
 
     return (
         ordered.group_by(["src_ip", "window_start"], maintain_order=True)
@@ -152,6 +153,7 @@ def flow_window_features(frame: pl.DataFrame, window: WindowSpec) -> pl.DataFram
             pl.col("label").last().alias("label"),
             pl.col("scenario").last().alias("scenario"),
             *carry_split,
+            *carry_run_id,
         )
         .with_columns(
             _iat_std_expr(

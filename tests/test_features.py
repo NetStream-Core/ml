@@ -271,3 +271,15 @@ def test_flow_window_features_has_no_split_column_when_absent() -> None:
     rows = pl.DataFrame([_flow_row(0)])
     result = features.flow_window_features(rows, features.WindowSpec(5))
     assert "split" not in result.columns
+
+
+def test_flow_window_features_carries_through_a_run_id_column_when_present() -> None:
+    rows = pl.DataFrame([_flow_row(0)]).with_columns(pl.lit("run-42").alias("run_id"))
+    result = features.flow_window_features(rows, features.WindowSpec(5))
+    assert result.row(0, named=True)["run_id"] == "run-42"
+
+
+def test_flow_window_features_has_no_run_id_column_when_absent() -> None:
+    rows = pl.DataFrame([_flow_row(0)])
+    result = features.flow_window_features(rows, features.WindowSpec(5))
+    assert "run_id" not in result.columns

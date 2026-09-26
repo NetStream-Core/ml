@@ -23,6 +23,7 @@ from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.features import WindowSpec, build_features
+from netstream_ml.intensity import attach_rate, evaluate_by_rate
 from netstream_ml.split import (
     SplitConfig,
     SplitRatios,
@@ -164,6 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
     random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
     random_forest.add_argument("--random-state", type=int, default=0)
 
+    _add_evaluate_subparsers(subparsers)
+
+    return parser
+
+
+def _add_evaluate_subparsers(
+    subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+) -> None:
     evaluate = subparsers.add_parser(
         "evaluate", help="model-agnostic evaluation tools (PR curves, seed spread, significance)"
     )
@@ -190,7 +199,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="random seeds to refit the Isolation Forest and Random Forest under",
     )
 
-    return parser
+    intensity = evaluate_subparsers.add_parser(
+        "intensity",
+        help="check whether recall holds up as an attack's rate drops, per scenario, "
+        "for each of the three baselines",
+    )
+    intensity.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split "
+        "column and a run_id column)",
+    )
+    intensity.add_argument("--window", type=int, default=5, help="window size in seconds")
+    intensity.add_argument("--target-fpr", type=float, default=0.01)
+    intensity.add_argument("--contamination", type=float, default=0.01)
+    intensity.add_argument("--random-state", type=int, default=0)
 
 
 def _run_export(args: argparse.Namespace) -> int:
@@ -528,6 +551,59 @@ def _run_evaluate_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_evaluate_intensity(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+    if "run_id" not in frame.columns:
+        print(
+            f"{path} has no 'run_id' column; rebuild features with a version of this "
+            "tool that carries run_id through",
+            file=sys.stderr,
+        )
+        return 1
+
+    labels = pl.read_parquet(args.dataset_dir / "labels.parquet")
+    frame = attach_rate(frame, labels)
+
+    train = frame.filter(pl.col("split") == "train")
+    val = frame.filter(pl.col("split") == "val")
+    held_out = frame.filter(pl.col("split") != "train")
+    if held_out.height == 0:
+        print(f"{path} has no held-out (val/test) rows to evaluate on", file=sys.stderr)
+        return 1
+
+    threshold_model = fit_threshold_baseline(train, target_fpr=args.target_fpr)
+    iso_model = fit_isolation_forest(train, IsolationForestConfig(contamination=args.contamination))
+    rf_tuning = tune_random_forest(train, val, random_state=args.random_state)
+    rf_model = fit_random_forest(train, rf_tuning.config)
+
+    result: dict[str, object] = {"window_seconds": args.window}
+    for name, model in (
+        ("threshold", threshold_model),
+        ("isolation_forest", iso_model),
+        ("random_forest", rf_model),
+    ):
+        by_rate = evaluate_by_rate(model.predict(held_out), held_out)
+        result[name] = [g.to_dict() for g in by_rate]
+        print(f"--- {name} ---")
+        for group in by_rate:
+            print(
+                f"{group.scenario} rate={group.rate}: recall={group.metrics.recall:.3f} "
+                f"fpr={group.metrics.fpr:.3f} (n={group.n})"
+            )
+
+    out_path = args.dataset_dir / f"evaluate_intensity_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"intensity report written to {out_path}")
+    return 0
+
+
 _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("data", "export"): _run_export,
     ("data", "split"): _run_split,
@@ -536,6 +612,7 @@ _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("baseline", "isolation-forest"): _run_baseline_isolation_forest,
     ("baseline", "random-forest"): _run_baseline_random_forest,
     ("evaluate", "compare"): _run_evaluate_compare,
+    ("evaluate", "intensity"): _run_evaluate_intensity,
 }
 
 _SUBCOMMAND_ATTR = {
