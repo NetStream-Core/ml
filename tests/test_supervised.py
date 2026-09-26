@@ -130,3 +130,17 @@ def test_tune_random_forest_picks_a_config_that_scores_well_on_validation() -> N
     assert result.val_metrics.f1 > 0.9
     model = supervised.fit_random_forest(train, result.config)
     assert model.features == ("packets_total", "unique_dst_ports")
+
+
+def test_decision_score_ranks_attacks_above_benign_rows() -> None:
+    train = _labelled_dataset()
+    config = RandomForestConfig(
+        features=("packets_total", "unique_dst_ports"), n_estimators=50, random_state=0
+    )
+    model = supervised.fit_random_forest(train, config)
+
+    scores = model.decision_score(train)
+
+    benign_scores = scores.filter(train["label"] == "benign").to_numpy()
+    attack_scores = scores.filter(train["label"] != "benign").to_numpy()
+    assert attack_scores.min() > benign_scores.max()
