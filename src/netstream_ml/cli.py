@@ -39,6 +39,7 @@ from netstream_ml.supervised import (
     fit_random_forest,
     tune_random_forest,
 )
+from netstream_ml.tracking import track_run
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -336,6 +337,12 @@ def _run_baseline_threshold(args: argparse.Namespace) -> int:
     out_path = args.dataset_dir / f"baseline_threshold_w{args.window}.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"baseline report written to {out_path}")
+
+    with track_run(
+        "baseline-threshold", {"window_seconds": args.window, "target_fpr": args.target_fpr}
+    ) as run:
+        run.log_metrics(metrics_by_split)
+        run.log_artifact(out_path)
     return 0
 
 
@@ -389,6 +396,18 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     out_path = args.dataset_dir / f"isolation_forest_w{args.window}.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"isolation forest report written to {out_path}")
+
+    with track_run(
+        "baseline-isolation-forest",
+        {
+            "window_seconds": args.window,
+            "contamination": args.contamination,
+            "n_estimators": args.n_estimators,
+            "random_state": args.random_state,
+        },
+    ) as run:
+        run.log_metrics(metrics_by_split)
+        run.log_artifact(out_path)
     return 0
 
 
@@ -444,6 +463,13 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     out_path = args.dataset_dir / f"random_forest_w{args.window}.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"random forest report written to {out_path}")
+
+    with track_run(
+        "baseline-random-forest",
+        {"window_seconds": args.window, "random_state": args.random_state, **tuning.to_dict()},
+    ) as run:
+        run.log_metrics(metrics_by_split)
+        run.log_artifact(out_path)
     return 0
 
 
@@ -548,6 +574,18 @@ def _run_evaluate_compare(args: argparse.Namespace) -> int:
     out_path = args.dataset_dir / f"evaluate_compare_w{args.window}.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"comparison report written to {out_path}")
+
+    with track_run(
+        "evaluate-compare",
+        {
+            "window_seconds": args.window,
+            "target_fpr": args.target_fpr,
+            "contamination": args.contamination,
+            "seeds": args.seeds,
+        },
+    ) as run:
+        run.log_metrics(result)
+        run.log_artifact(out_path)
     return 0
 
 
