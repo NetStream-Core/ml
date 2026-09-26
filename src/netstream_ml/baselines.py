@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import polars as pl
 
 DEFAULT_CANDIDATE_FEATURES = (
@@ -47,6 +48,19 @@ class ThresholdRule:
     def to_dict(self) -> dict[str, object]:
         return {"feature": self.feature, "threshold": self.threshold, "direction": self.direction}
 
+    def excess(self, frame: pl.DataFrame) -> pl.Series:
+        """How far past this rule's own threshold each row's value falls,
+        as a fraction of the threshold — 0 at the threshold, positive
+        beyond it, growing without bound the further past it a row is.
+        Used only to rank rows by "how attack-like", not to decide
+        pass/fail (`fires` does that); a null value counts as not exceeding
+        the threshold, same as in `fires`."""
+        column = frame[self.feature].fill_null(0.0)
+        threshold = self.threshold if self.threshold != 0 else 1.0
+        if self.direction == "above":
+            return ((column - self.threshold) / abs(threshold)).alias("excess")
+        return ((self.threshold - column) / abs(threshold)).alias("excess")
+
 
 @dataclass(frozen=True, slots=True)
 class ThresholdBaseline:
@@ -60,6 +74,16 @@ class ThresholdBaseline:
         for series in fired[1:]:
             result = result | series
         return result.alias("predicted")
+
+    def decision_score(self, frame: pl.DataFrame) -> pl.Series:
+        """The largest normalized excess over any single rule's threshold —
+        a continuous stand-in for "how attack-like", for tracing a
+        precision/recall curve rather than reading off the one point
+        `predict`'s fixed thresholds happen to land on."""
+        if not self.rules:
+            return pl.Series("score", [0.0] * frame.height)
+        excesses = np.stack([rule.excess(frame).to_numpy() for rule in self.rules])
+        return pl.Series("score", excesses.max(axis=0))
 
     def to_dict(self) -> list[dict[str, object]]:
         return [rule.to_dict() for rule in self.rules]

@@ -290,6 +290,7 @@ dependencies = [
     { name = "numpy" },
     { name = "polars" },
     { name = "scikit-learn" },
+    { name = "scipy" },
 ]
 
 [package.dev-dependencies]
@@ -304,6 +305,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "polars", specifier = ">=1.18" },
     { name = "scikit-learn", specifier = ">=1.5" },
+    { name = "scipy", specifier = ">=1.14" },
 ]
 
 [package.metadata.requires-dev]

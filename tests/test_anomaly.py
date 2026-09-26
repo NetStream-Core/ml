@@ -89,6 +89,28 @@ def test_isolation_forest_flags_an_off_manifold_feature_combination() -> None:
     assert metrics.fpr == pytest.approx(0.05, abs=0.02)
 
 
+def test_decision_score_ranks_the_off_manifold_attack_above_benign_rows() -> None:
+    train = _correlated_benign_frame()
+    config = IsolationForestConfig(
+        features=("packets_total", "unique_dst_ports"), contamination=0.05, random_state=0
+    )
+    model = anomaly.fit_isolation_forest(train, config)
+
+    attack = pl.DataFrame(
+        {
+            "packets_total": [50, 50, 50],
+            "unique_dst_ports": [1, 1, 1],
+            "label": ["port_scan"] * 3,
+            "scenario": ["port_scan"] * 3,
+        }
+    )
+    scores = model.decision_score(pl.concat([train, attack]))
+
+    benign_scores = scores.slice(0, train.height).to_numpy()
+    attack_scores = scores.slice(train.height, attack.height).to_numpy()
+    assert attack_scores.min() > benign_scores.mean()
+
+
 def test_evaluate_isolation_forest_by_scenario_separates_lookalike_scenarios() -> None:
     train = _correlated_benign_frame()
     config = IsolationForestConfig(
