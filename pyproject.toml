@@ -5,7 +5,9 @@ description = "Datasets, features, models and evaluation for the NetStream netwo
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "polars>=1.18",
+]
 
 [project.scripts]
 netstream-ml = "netstream_ml.cli:main"
