@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "polars>=1.18",
+    "scikit-learn>=1.5",
+    "numpy>=2.0",
 ]
 
 [project.scripts]
@@ -41,3 +43,7 @@ addopts = "-ra --strict-markers"
 [tool.mypy]
 strict = true
 files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = "sklearn.*"
+ignore_missing_imports = true
