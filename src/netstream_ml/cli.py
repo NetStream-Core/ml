@@ -2,12 +2,18 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import polars as pl
 
 from netstream_ml import __version__
+from netstream_ml.anomaly import (
+    IsolationForestConfig,
+    evaluate_isolation_forest,
+    evaluate_isolation_forest_by_scenario,
+    fit_isolation_forest,
+)
 from netstream_ml.baselines import (
     evaluate_baseline,
     evaluate_baseline_by_scenario,
@@ -118,6 +124,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="each feature's threshold false-alarms on about this share of training benign traffic",
     )
+
+    isolation_forest = baseline_subparsers.add_parser(
+        "isolation-forest",
+        help="an Isolation Forest fit on benign windows across all features at once",
+    )
+    isolation_forest.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    isolation_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
+    isolation_forest.add_argument(
+        "--contamination",
+        type=float,
+        default=0.01,
+        help="share of training benign traffic the model itself flags as an outlier",
+    )
+    isolation_forest.add_argument("--n-estimators", type=int, default=100)
+    isolation_forest.add_argument("--random-state", type=int, default=0)
 
     return parser
 
@@ -245,6 +270,74 @@ def _run_baseline_threshold(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    config = IsolationForestConfig(
+        contamination=args.contamination,
+        n_estimators=args.n_estimators,
+        random_state=args.random_state,
+    )
+    model = fit_isolation_forest(train, config)
+
+    metrics_by_split: dict[str, object] = {}
+    for split_name in ("train", "val", "test"):
+        subset = frame.filter(pl.col("split") == split_name)
+        if subset.height == 0:
+            continue
+        metrics = evaluate_isolation_forest(model, subset)
+        metrics_by_split[split_name] = metrics.to_dict()
+        print(
+            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
+            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
+        )
+
+    test = frame.filter(pl.col("split") == "test")
+    by_scenario = (
+        {
+            scenario: metrics.to_dict()
+            for scenario, metrics in evaluate_isolation_forest_by_scenario(model, test).items()
+        }
+        if test.height > 0
+        else {}
+    )
+
+    result = {
+        "window_seconds": args.window,
+        "contamination": args.contamination,
+        "model": model.to_dict(),
+        "metrics_by_split": metrics_by_split,
+        "test_metrics_by_scenario": by_scenario,
+    }
+    out_path = args.dataset_dir / f"isolation_forest_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"isolation forest report written to {out_path}")
+    return 0
+
+
+_HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
+    ("data", "export"): _run_export,
+    ("data", "split"): _run_split,
+    ("features", "build"): _run_features_build,
+    ("baseline", "threshold"): _run_baseline_threshold,
+    ("baseline", "isolation-forest"): _run_baseline_isolation_forest,
+}
+
+_SUBCOMMAND_ATTR = {
+    "data": "data_command",
+    "features": "features_command",
+    "baseline": "baseline_command",
+}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -253,14 +346,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    if args.command == "data" and args.data_command == "export":
-        return _run_export(args)
-    if args.command == "data" and args.data_command == "split":
-        return _run_split(args)
-    if args.command == "features" and args.features_command == "build":
-        return _run_features_build(args)
-    if args.command == "baseline" and args.baseline_command == "threshold":
-        return _run_baseline_threshold(args)
-
-    parser.print_help()
-    return 2
+    subcommand = getattr(args, _SUBCOMMAND_ATTR.get(args.command, ""), None)
+    handler = _HANDLERS.get((args.command, subcommand))
+    if handler is None:
+        parser.print_help()
+        return 2
+    return handler(args)

@@ -270,3 +270,32 @@ def test_baseline_threshold_fails_clearly_without_a_split_column(tmp_path: Path)
     exit_code = main(["baseline", "threshold", str(tmp_path)])
 
     assert exit_code == 1
+
+
+def test_baseline_isolation_forest_writes_a_report_with_metrics_by_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+
+    exit_code = main(
+        ["baseline", "isolation-forest", str(tmp_path), "--window", "5", "--contamination", "0.1"]
+    )
+
+    assert exit_code == 0
+    report = json.loads((tmp_path / "isolation_forest_w5.json").read_text())
+    assert report["window_seconds"] == 5
+    assert report["contamination"] == 0.1
+    assert "train" in report["metrics_by_split"]
+    assert "test" in report["test_metrics_by_scenario"] or report["test_metrics_by_scenario"]
+    assert "isolation forest report written to" in capsys.readouterr().out
+
+
+def test_baseline_isolation_forest_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"packets_total": [1, 2], "label": ["benign", "benign"]}).write_parquet(
+        tmp_path / "features_w5.parquet"
+    )
+
+    exit_code = main(["baseline", "isolation-forest", str(tmp_path)])
+
+    assert exit_code == 1
