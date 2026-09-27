@@ -15,6 +15,7 @@ from netstream_ml.anomaly import (
     fit_isolation_forest,
 )
 from netstream_ml.baselines import (
+    ClassificationMetrics,
     evaluate_baseline,
     evaluate_baseline_by_scenario,
     fit_threshold_baseline,
@@ -22,6 +23,12 @@ from netstream_ml.baselines import (
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
+from netstream_ml.external import (
+    RECONSTRUCTABLE_FEATURES,
+    UNRECONSTRUCTABLE_FEATURES,
+    external_window_features,
+    load_cic_csv,
+)
 from netstream_ml.features import WindowSpec, build_features
 from netstream_ml.intensity import attach_rate, evaluate_by_rate
 from netstream_ml.split import (
@@ -215,6 +222,24 @@ def _add_evaluate_subparsers(
     intensity.add_argument("--target-fpr", type=float, default=0.01)
     intensity.add_argument("--contamination", type=float, default=0.01)
     intensity.add_argument("--random-state", type=int, default=0)
+
+    transfer = evaluate_subparsers.add_parser(
+        "transfer",
+        help="retrain each baseline on a reconstructable feature subset and check "
+        "generalisation to an external CICFlowMeter dataset (CIC-IDS2017/CIC-DDoS2019)",
+    )
+    transfer.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    transfer.add_argument(
+        "external_csv", type=Path, help="a CICFlowMeter CSV (e.g. one CIC-IDS2017 day file)"
+    )
+    transfer.add_argument("--window", type=int, default=5, help="window size in seconds")
+    transfer.add_argument("--target-fpr", type=float, default=0.01)
+    transfer.add_argument("--contamination", type=float, default=0.01)
+    transfer.add_argument("--random-state", type=int, default=0)
 
 
 def _run_export(args: argparse.Namespace) -> int:
@@ -642,6 +667,110 @@ def _run_evaluate_intensity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _transfer_entry(
+    name: str,
+    lab_metrics: ClassificationMetrics | None,
+    external_metrics: ClassificationMetrics,
+    external_by_scenario: dict[str, ClassificationMetrics],
+) -> dict[str, object]:
+    entry: dict[str, object] = {}
+    if lab_metrics is not None:
+        entry["lab_test_same_features"] = lab_metrics.to_dict()
+        print(
+            f"{name} (lab test, reduced features): precision={lab_metrics.precision:.3f} "
+            f"recall={lab_metrics.recall:.3f} f1={lab_metrics.f1:.3f}"
+        )
+    entry["external"] = external_metrics.to_dict()
+    entry["external_by_scenario"] = {
+        scenario: metrics.to_dict() for scenario, metrics in external_by_scenario.items()
+    }
+    print(
+        f"{name} (external): precision={external_metrics.precision:.3f} "
+        f"recall={external_metrics.recall:.3f} f1={external_metrics.f1:.3f} "
+        f"fpr={external_metrics.fpr:.3f}"
+    )
+    return entry
+
+
+def _run_evaluate_transfer(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    external_flows = load_cic_csv(args.external_csv)
+    external = external_window_features(external_flows, WindowSpec(args.window))
+    if external.height == 0:
+        print(f"{args.external_csv} produced no windows", file=sys.stderr)
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    val = frame.filter(pl.col("split") == "val")
+    lab_test = frame.filter(pl.col("split") == "test")
+
+    threshold_model = fit_threshold_baseline(
+        train, features_to_consider=RECONSTRUCTABLE_FEATURES, target_fpr=args.target_fpr
+    )
+    iso_model = fit_isolation_forest(
+        train,
+        IsolationForestConfig(
+            features=RECONSTRUCTABLE_FEATURES, contamination=args.contamination
+        ),
+    )
+    rf_tuning = tune_random_forest(
+        train, val, features=RECONSTRUCTABLE_FEATURES, random_state=args.random_state
+    )
+    rf_model = fit_random_forest(train, rf_tuning.config)
+
+    result: dict[str, object] = {
+        "window_seconds": args.window,
+        "reconstructable_features": list(RECONSTRUCTABLE_FEATURES),
+        "unreconstructable_features": list(UNRECONSTRUCTABLE_FEATURES),
+        "external_windows": external.height,
+        "external_scenarios": sorted(external["scenario"].unique().to_list()),
+        "threshold": _transfer_entry(
+            "threshold",
+            evaluate_baseline(threshold_model, lab_test) if lab_test.height > 0 else None,
+            evaluate_baseline(threshold_model, external),
+            evaluate_baseline_by_scenario(threshold_model, external),
+        ),
+        "isolation_forest": _transfer_entry(
+            "isolation_forest",
+            evaluate_isolation_forest(iso_model, lab_test) if lab_test.height > 0 else None,
+            evaluate_isolation_forest(iso_model, external),
+            evaluate_isolation_forest_by_scenario(iso_model, external),
+        ),
+        "random_forest": _transfer_entry(
+            "random_forest",
+            evaluate_random_forest(rf_model, lab_test) if lab_test.height > 0 else None,
+            evaluate_random_forest(rf_model, external),
+            evaluate_random_forest_by_scenario(rf_model, external),
+        ),
+    }
+
+    out_path = args.dataset_dir / f"evaluate_transfer_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"transfer report written to {out_path}")
+
+    with track_run(
+        "evaluate-transfer",
+        {
+            "window_seconds": args.window,
+            "target_fpr": args.target_fpr,
+            "contamination": args.contamination,
+            "random_state": args.random_state,
+            "external_csv": str(args.external_csv),
+        },
+    ) as run:
+        run.log_metrics(result)
+        run.log_artifact(out_path)
+    return 0
+
+
 _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("data", "export"): _run_export,
     ("data", "split"): _run_split,
@@ -651,6 +780,7 @@ _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("baseline", "random-forest"): _run_baseline_random_forest,
     ("evaluate", "compare"): _run_evaluate_compare,
     ("evaluate", "intensity"): _run_evaluate_intensity,
+    ("evaluate", "transfer"): _run_evaluate_transfer,
 }
 
 _SUBCOMMAND_ATTR = {
