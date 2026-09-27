@@ -365,3 +365,57 @@ def test_evaluate_compare_fails_clearly_without_test_rows(tmp_path: Path) -> Non
     exit_code = main(["evaluate", "compare", str(tmp_path)])
 
     assert exit_code == 1
+
+
+_CIC_HEADER = (
+    " Source IP, Destination IP, Destination Port, Timestamp,"
+    " Total Fwd Packets, Total Backward Packets,"
+    " Total Length of Fwd Packets, Total Length of Bwd Packets,"
+    " SYN Flag Count, RST Flag Count, Flow IAT Mean, Flow IAT Std, Label"
+)
+
+
+def _write_external_csv(path: Path) -> None:
+    rows = [
+        "10.0.1.1,10.0.1.2,443,5/7/2017 8:00:00,4,3,400,300,1,0,500.0,20.0,BENIGN",
+        "10.0.1.9,10.0.1.3,22,5/7/2017 8:00:05,20,0,2000,0,20,10,10.0,2.0,DDoS",
+    ]
+    path.write_text(_CIC_HEADER + "\n" + "\n".join(rows) + "\n")
+
+
+def test_evaluate_transfer_writes_a_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    external_csv = tmp_path / "external.csv"
+    _write_external_csv(external_csv)
+
+    exit_code = main(
+        ["evaluate", "transfer", str(tmp_path), str(external_csv), "--window", "5"]
+    )
+
+    assert exit_code == 0
+    report = json.loads((tmp_path / "evaluate_transfer_w5.json").read_text())
+    assert report["window_seconds"] == 5
+    assert "dns_entropy_mean" in report["unreconstructable_features"]
+    assert "syn_ratio" in report["reconstructable_features"]
+    assert report["external_windows"] > 0
+    for name in ("threshold", "isolation_forest", "random_forest"):
+        assert "external" in report[name]
+        assert "lab_test_same_features" in report[name]
+    out = capsys.readouterr().out
+    assert "external):" in out
+    assert "transfer report written to" in out
+
+
+def test_evaluate_transfer_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"packets_total": [1, 2], "label": ["benign", "benign"]}).write_parquet(
+        tmp_path / "features_w5.parquet"
+    )
+    external_csv = tmp_path / "external.csv"
+    _write_external_csv(external_csv)
+
+    exit_code = main(["evaluate", "transfer", str(tmp_path), str(external_csv)])
+
+    assert exit_code == 1
