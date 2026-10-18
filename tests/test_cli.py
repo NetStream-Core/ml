@@ -280,12 +280,123 @@ def test_baseline_threshold_save_model_round_trips_through_detect_run(
     assert loaded.predict(pl.read_parquet(tmp_path / "features_w5.parquet")) is not None
 
 
-def test_detect_run_fails_clearly_when_the_model_file_is_missing(tmp_path: Path) -> None:
+def test_baseline_threshold_register_model_requires_save_model(tmp_path: Path) -> None:
+    _write_features_dataset_with_split(tmp_path)
+
     exit_code = main(
-        ["detect", "run", "--model", str(tmp_path / "no-such-model.joblib")]
+        [
+            "baseline",
+            "threshold",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--register-model",
+            "threshold",
+            "--model-version",
+            "v1",
+        ]
     )
 
     assert exit_code == 1
+
+
+def test_baseline_threshold_register_model_requires_model_version(tmp_path: Path) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+
+    exit_code = main(
+        [
+            "baseline",
+            "threshold",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--save-model",
+            str(model_path),
+            "--register-model",
+            "threshold",
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_baseline_threshold_register_model_publishes_the_saved_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+    seen: dict[str, object] = {}
+
+    def fake_publish_model(config: object, path: Path, metadata: object) -> dict[str, object]:
+        seen["config"] = config
+        seen["path"] = path
+        seen["metadata"] = metadata
+        return {}
+
+    monkeypatch.setattr(cli, "publish_model", fake_publish_model)
+
+    exit_code = main(
+        [
+            "baseline",
+            "threshold",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--save-model",
+            str(model_path),
+            "--register-model",
+            "threshold",
+            "--model-version",
+            "v1",
+            "--backend-url",
+            "http://backend:8080",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen["path"] == model_path
+    assert seen["metadata"].name == "threshold"  # type: ignore[attr-defined]
+    assert seen["metadata"].version == "v1"  # type: ignore[attr-defined]
+    assert seen["metadata"].algorithm == "threshold"  # type: ignore[attr-defined]
+    assert "model registered: threshold@v1" in capsys.readouterr().out
+
+
+def test_detect_run_fails_clearly_when_the_registry_is_unreachable() -> None:
+    exit_code = main(
+        [
+            "detect",
+            "run",
+            "--model-name",
+            "threshold",
+            "--backend-url",
+            "http://127.0.0.1:59999",
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_detect_run_loads_the_named_model_and_starts_the_kafka_loop(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "latest_version", lambda config, name: "v2")
+    monkeypatch.setattr(cli, "load_model_from_registry", lambda config, name, version: "fake-model")
+
+    def fake_run_kafka_detector(config: object) -> None:
+        seen["config"] = config
+
+    monkeypatch.setattr(cli, "run_kafka_detector", fake_run_kafka_detector)
+
+    exit_code = main(
+        ["detect", "run", "--model-name", "threshold", "--backend-url", "http://backend:8080"]
+    )
+
+    assert exit_code == 0
+    assert seen["config"].model == "fake-model"  # type: ignore[attr-defined]
+    assert "model loaded: threshold@v2 from http://backend:8080" in capsys.readouterr().out
 
 
 def test_baseline_threshold_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
@@ -472,9 +583,7 @@ def test_evaluate_transfer_writes_a_report(
     external_csv = tmp_path / "external.csv"
     _write_external_csv(external_csv)
 
-    exit_code = main(
-        ["evaluate", "transfer", str(tmp_path), str(external_csv), "--window", "5"]
-    )
+    exit_code = main(["evaluate", "transfer", str(tmp_path), str(external_csv), "--window", "5"])
 
     assert exit_code == 0
     report = json.loads((tmp_path / "evaluate_transfer_w5.json").read_text())

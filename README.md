@@ -233,21 +233,32 @@ uv run mlflow ui   # http://127.0.0.1:5000 — сравнение прогоно
 
 На каждый `host_id` — свой `WindowAccumulator`, а не один общий: накопитель ключует окна только по `src_ip`, а два разных сенсора могут легитимно видеть перекрывающиеся приватные диапазоны адресов (разные площадки, разные VLAN) — общий накопитель на всех сенсоров незаметно слил бы их окна.
 
-### Сохранение модели для детектора
+### Сохранение и регистрация модели (M14)
 
-Любой из четырёх `baseline`-команд (`threshold`, `isolation-forest`, `random-forest`, `gradient-boosting`) умеет дополнительно сохранить обученную модель для детектора:
+Любой из четырёх `baseline`-команд (`threshold`, `isolation-forest`, `random-forest`, `gradient-boosting`) умеет дополнительно сохранить обученную модель локально (`joblib.dump` в её исходном виде, без ONNX-конвертации — детектор зависит только от общего протокола `.predict(frame)`/`.decision_score(frame)`, который уже реализуют все четыре baseline'а, а не от конкретного класса модели):
 
 ```bash
 uv run netstream-ml baseline random-forest data/v1 --window 5 --save-model artifacts/model.joblib
 ```
 
-Модель сохраняется через `joblib.dump` в её исходном виде, без ONNX-конвертации: детектор зависит только от общего протокола `.predict(frame)`/`.decision_score(frame)`, который уже реализуют все четыре baseline'а (включая gradient boosting), а не от конкретного класса модели. Экспорт в ONNX и обращение к реестру моделей вместо локального файла — задача M14, реальный следующий шаг, а не блокер для первого рабочего цикла: `detect run` ниже уже работает на `joblib`-файле как есть.
+Чтобы `detect run` мог взять эту модель без локального файла на диске (например, запущенный в отдельном контейнере/хосте), `--save-model` можно дополнить регистрацией в реестре моделей `backend` (`internal/models`, артефакт лежит в S3-совместимом `objectstore`, сам backend никогда не проксирует байты — отдаёт 302 на presigned URL):
+
+```bash
+uv run netstream-ml baseline random-forest data/v1 --window 5 \
+    --save-model artifacts/model.joblib \
+    --register-model random-forest --model-version 2026-10-18 \
+    --backend-url http://127.0.0.1:9999
+```
+
+`--register-model` требует и `--save-model` (откуда берутся байты), и `--model-version` (у backend нет отдельного алиаса "latest" — версии различаются только явной строкой, обычно датой или git SHA); без одного из них команда возвращает ошибку и ничего не публикует. Проверено на реальном стенде (реальный `backend` на Postgres + SeaweedFS): `baseline threshold --save-model --register-model` реально регистрирует модель и заливает артефакт, а прямой вызов `model_registry.load_model` реально скачивает его через presigned-редирект и разворачивает `joblib.load` — без доступа к S3-ключам на стороне `ml`.
+
+**Что здесь не сделано.** M14 закрывает только "подтяжку модели из реестра вместо локального файла" — сама модель как была, так и остаётся `joblib`-сериализованным объектом sklearn/xgboost, без экспорта в ONNX. Экспорт в ONNX — отдельная задача (конвертация различается по типу модели: `sklearn-onnx` для порогов/Isolation Forest/Random Forest, `onnxmltools`/встроенный экспорт для XGBoost, плюс проверка, что `decision_score` действительно совпадает после конвертации) и реальный следующий шаг, а не блокер: `detect run` и реестр моделей уже работают на `joblib`-артефактах как есть.
 
 ### `detect run`
 
 ```bash
 uv run netstream-ml detect run \
-    --model artifacts/model.joblib \
+    --model-name random-forest \
     --window 5 \
     --bootstrap-servers localhost:9092 \
     --events-topic netstream.events.v1 \
@@ -256,7 +267,7 @@ uv run netstream-ml detect run \
     --idle-flush-seconds 30
 ```
 
-Все флаги, кроме `--model`, можно задать переменными окружения вместо флагов: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_EVENTS_TOPIC`, `KAFKA_DETECTIONS_TOPIC`, `KAFKA_CONSUMER_GROUP` — тот же принцип, что и у `CLICKHOUSE_URL` для offline-команд.
+`--model-name` обязателен, `--model-version` по умолчанию берёт самую новую зарегистрированную версию этого имени (backend сортирует список по `(name, created_at DESC)`, так что первое совпадение по имени уже самое новое — отдельного алиаса для этого нет). `--backend-url` можно не указывать явно — он читается из `BACKEND_URL`. Остальные флаги можно задать переменными окружения вместо флагов: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_EVENTS_TOPIC`, `KAFKA_DETECTIONS_TOPIC`, `KAFKA_CONSUMER_GROUP` — тот же принцип, что и у `CLICKHOUSE_URL` для offline-команд.
 
 Консюмер читает `--events-topic`, декодирует OTLP-батч, кормит окна в накопитель своего `host_id` и для каждого закрывшегося окна считает `score`/`is_attack` обученной моделью, публикует результат в `--detections-topic` и пишет его в лог, если это атака. Окно, не получившее более позднюю запись того же источника (источник ушёл в тишину), иначе осталось бы открытым навсегда — поэтому раз в `--idle-flush-seconds` детектор принудительно закрывает (`flush`) все ещё открытые окна по всем сенсорам, а также один раз при остановке. При завершении печатает p50/p95 задержки по всем сделанным детекциям.
 
