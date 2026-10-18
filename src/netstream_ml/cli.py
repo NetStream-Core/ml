@@ -23,7 +23,7 @@ from netstream_ml.baselines import (
 )
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
-from netstream_ml.detector import KafkaDetectorConfig, load_model, run_kafka_detector, save_model
+from netstream_ml.detector import KafkaDetectorConfig, run_kafka_detector, save_model
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.external import (
     RECONSTRUCTABLE_FEATURES,
@@ -39,6 +39,14 @@ from netstream_ml.gradient_boosting import (
     tune_gradient_boosting,
 )
 from netstream_ml.intensity import attach_rate, evaluate_by_rate
+from netstream_ml.model_registry import (
+    ModelMetadata,
+    RegistryConfig,
+    RegistryError,
+    latest_version,
+    publish_model,
+)
+from netstream_ml.model_registry import load_model as load_model_from_registry
 from netstream_ml.split import (
     SplitConfig,
     SplitRatios,
@@ -55,6 +63,29 @@ from netstream_ml.supervised import (
     tune_random_forest,
 )
 from netstream_ml.tracking import track_run
+
+
+def _add_save_model_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="also joblib.dump the fitted model here",
+    )
+    parser.add_argument(
+        "--register-model",
+        default=None,
+        help="also register --save-model's artifact with the backend's model registry under "
+        "this name, for `detect run --model-name` (requires --save-model and --model-version)",
+    )
+    parser.add_argument(
+        "--model-version",
+        default=None,
+        help="version string for --register-model (e.g. a git SHA or a date)",
+    )
+    parser.add_argument(
+        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,12 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="each feature's threshold false-alarms on about this share of training benign traffic",
     )
-    threshold.add_argument(
-        "--save-model",
-        type=Path,
-        default=None,
-        help="also joblib.dump the fitted model here, for `detect run --model`",
-    )
+    _add_save_model_args(threshold)
 
     isolation_forest = baseline_subparsers.add_parser(
         "isolation-forest",
@@ -174,12 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     isolation_forest.add_argument("--n-estimators", type=int, default=100)
     isolation_forest.add_argument("--random-state", type=int, default=0)
-    isolation_forest.add_argument(
-        "--save-model",
-        type=Path,
-        default=None,
-        help="also joblib.dump the fitted model here, for `detect run --model`",
-    )
+    _add_save_model_args(isolation_forest)
 
     random_forest = baseline_subparsers.add_parser(
         "random-forest",
@@ -192,12 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
     random_forest.add_argument("--random-state", type=int, default=0)
-    random_forest.add_argument(
-        "--save-model",
-        type=Path,
-        default=None,
-        help="also joblib.dump the fitted model here, for `detect run --model`",
-    )
+    _add_save_model_args(random_forest)
 
     gradient_boosting = baseline_subparsers.add_parser(
         "gradient-boosting",
@@ -210,12 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gradient_boosting.add_argument("--window", type=int, default=5, help="window size in seconds")
     gradient_boosting.add_argument("--random-state", type=int, default=0)
-    gradient_boosting.add_argument(
-        "--save-model",
-        type=Path,
-        default=None,
-        help="also joblib.dump the fitted model here, for `detect run --model`",
-    )
+    _add_save_model_args(gradient_boosting)
 
     _add_evaluate_subparsers(subparsers)
     _add_detect_subparsers(subparsers)
@@ -236,11 +247,17 @@ def _add_detect_subparsers(
         help="consume netstream.events.v1, score completed windows, produce detections",
     )
     run.add_argument(
-        "--model",
-        type=Path,
+        "--model-name",
         required=True,
-        help="a model saved by `baseline ... --save-model` (any baseline works: they all "
-        "share .predict()/.decision_score())",
+        help="a model registered via `baseline ... --save-model ... --register-model NAME`",
+    )
+    run.add_argument(
+        "--model-version",
+        default=None,
+        help="defaults to the newest version registered for --model-name",
+    )
+    run.add_argument(
+        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
     )
     run.add_argument("--window", type=int, default=5, help="window size in seconds")
     run.add_argument(
@@ -410,6 +427,35 @@ def _run_features_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_register_model(
+    args: argparse.Namespace, algorithm: str, metrics_by_split: dict[str, object]
+) -> int:
+    if args.register_model is None:
+        return 0
+    if args.save_model is None:
+        print("--register-model requires --save-model", file=sys.stderr)
+        return 1
+    if args.model_version is None:
+        print("--register-model requires --model-version", file=sys.stderr)
+        return 1
+
+    registry = RegistryConfig(backend_url=args.backend_url)
+    metadata = ModelMetadata(
+        name=args.register_model,
+        version=args.model_version,
+        algorithm=algorithm,
+        features_version=f"w{args.window}",
+        metrics=metrics_by_split,
+    )
+    try:
+        publish_model(registry, args.save_model, metadata)
+    except RegistryError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"model registered: {args.register_model}@{args.model_version} ({args.backend_url})")
+    return 0
+
+
 def _run_baseline_threshold(args: argparse.Namespace) -> int:
     path = args.dataset_dir / f"features_w{args.window}.parquet"
     frame = pl.read_parquet(path)
@@ -465,7 +511,7 @@ def _run_baseline_threshold(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return 0
+    return _maybe_register_model(args, "threshold", metrics_by_split)
 
 
 def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
@@ -534,7 +580,7 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return 0
+    return _maybe_register_model(args, "isolation-forest", metrics_by_split)
 
 
 def _run_baseline_random_forest(args: argparse.Namespace) -> int:
@@ -600,7 +646,7 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return 0
+    return _maybe_register_model(args, "random-forest", metrics_by_split)
 
 
 def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
@@ -666,7 +712,7 @@ def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return 0
+    return _maybe_register_model(args, "gradient-boosting", metrics_by_split)
 
 
 def _run_evaluate_compare(args: argparse.Namespace) -> int:
@@ -888,9 +934,7 @@ def _run_evaluate_transfer(args: argparse.Namespace) -> int:
     )
     iso_model = fit_isolation_forest(
         train,
-        IsolationForestConfig(
-            features=RECONSTRUCTABLE_FEATURES, contamination=args.contamination
-        ),
+        IsolationForestConfig(features=RECONSTRUCTABLE_FEATURES, contamination=args.contamination),
     )
     rf_tuning = tune_random_forest(
         train, val, features=RECONSTRUCTABLE_FEATURES, random_state=args.random_state
@@ -948,14 +992,14 @@ def _run_detect_run(args: argparse.Namespace) -> int:
     # logging module's default root level, and nothing else in this CLI
     # calls basicConfig since every other command only ever used print().
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    if not args.model.exists():
-        print(
-            f"{args.model} does not exist; save one with `baseline ... --save-model`",
-            file=sys.stderr,
-        )
+    registry = RegistryConfig(backend_url=args.backend_url)
+    try:
+        version = args.model_version or latest_version(registry, args.model_name)
+        model = load_model_from_registry(registry, args.model_name, version)
+    except RegistryError as error:
+        print(str(error), file=sys.stderr)
         return 1
-    model = load_model(args.model)
-    print(f"model loaded from {args.model}")
+    print(f"model loaded: {args.model_name}@{version} from {args.backend_url}")
     config = KafkaDetectorConfig(
         model=model,
         window_seconds=args.window,
