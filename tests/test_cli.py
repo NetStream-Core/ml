@@ -357,6 +357,61 @@ def test_baseline_random_forest_fails_clearly_without_a_split_column(tmp_path: P
     assert exit_code == 1
 
 
+def test_baseline_gradient_boosting_writes_a_report_with_metrics_by_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+
+    exit_code = main(["baseline", "gradient-boosting", str(tmp_path), "--window", "5"])
+
+    assert exit_code == 0
+    report = json.loads((tmp_path / "gradient_boosting_w5.json").read_text())
+    assert report["window_seconds"] == 5
+    assert "candidates_tried" in report["tuning"]
+    assert "train" in report["metrics_by_split"]
+    assert "test" in report["test_metrics_by_scenario"] or report["test_metrics_by_scenario"]
+    out = capsys.readouterr().out
+    assert "tuned:" in out
+    assert "gradient boosting report written to" in out
+
+
+def test_baseline_gradient_boosting_save_model_round_trips_through_detect_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+
+    exit_code = main(
+        [
+            "baseline",
+            "gradient-boosting",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--save-model",
+            str(model_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert model_path.exists()
+    assert f"model saved to {model_path}" in capsys.readouterr().out
+
+    loaded = load_model(model_path)
+    assert loaded.predict(pl.read_parquet(tmp_path / "features_w5.parquet")) is not None
+
+
+def test_baseline_gradient_boosting_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"packets_total": [1, 2], "label": ["benign", "benign"]}).write_parquet(
+        tmp_path / "features_w5.parquet"
+    )
+
+    exit_code = main(["baseline", "gradient-boosting", str(tmp_path)])
+
+    assert exit_code == 1
+
+
 def test_evaluate_compare_writes_a_report(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
