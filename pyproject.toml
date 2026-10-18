@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=2.0",
     "scipy>=1.14",
     "mlflow>=3.16.1",
+    "confluent-kafka>=2.16.0",
+    "opentelemetry-proto>=1.45.0",
 ]
 
 [project.scripts]
@@ -52,4 +54,12 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "scipy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "joblib.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "confluent_kafka.*"
 ignore_missing_imports = true
