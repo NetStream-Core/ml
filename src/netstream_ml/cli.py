@@ -30,6 +30,12 @@ from netstream_ml.external import (
     load_cic_csv,
 )
 from netstream_ml.features import WindowSpec, build_features
+from netstream_ml.gradient_boosting import (
+    evaluate_gradient_boosting,
+    evaluate_gradient_boosting_by_scenario,
+    fit_gradient_boosting,
+    tune_gradient_boosting,
+)
 from netstream_ml.intensity import attach_rate, evaluate_by_rate
 from netstream_ml.split import (
     SplitConfig,
@@ -172,6 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
     random_forest.add_argument("--random-state", type=int, default=0)
+
+    gradient_boosting = baseline_subparsers.add_parser(
+        "gradient-boosting",
+        help="an XGBoost model fit on labelled attack and benign windows, tuned on validation",
+    )
+    gradient_boosting.add_argument(
+        "dataset_dir",
+        type=Path,
+        help="directory produced by `features build` (features_w<N>.parquet, with a split column)",
+    )
+    gradient_boosting.add_argument("--window", type=int, default=5, help="window size in seconds")
+    gradient_boosting.add_argument("--random-state", type=int, default=0)
 
     _add_evaluate_subparsers(subparsers)
 
@@ -498,6 +516,68 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
+    path = args.dataset_dir / f"features_w{args.window}.parquet"
+    frame = pl.read_parquet(path)
+    if "split" not in frame.columns:
+        print(
+            f"{path} has no 'split' column; run `data split` before `features build`",
+            file=sys.stderr,
+        )
+        return 1
+
+    train = frame.filter(pl.col("split") == "train")
+    val = frame.filter(pl.col("split") == "val")
+    tuning = tune_gradient_boosting(train, val, random_state=args.random_state)
+    model = fit_gradient_boosting(train, tuning.config)
+    print(
+        f"tuned: n_estimators={tuning.config.n_estimators} max_depth={tuning.config.max_depth} "
+        f"learning_rate={tuning.config.learning_rate} (val f1={tuning.val_metrics.f1:.3f}, "
+        f"{tuning.candidates_tried} candidates)"
+    )
+
+    metrics_by_split: dict[str, object] = {}
+    for split_name in ("train", "val", "test"):
+        subset = frame.filter(pl.col("split") == split_name)
+        if subset.height == 0:
+            continue
+        metrics = evaluate_gradient_boosting(model, subset)
+        metrics_by_split[split_name] = metrics.to_dict()
+        print(
+            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
+            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
+        )
+
+    test = frame.filter(pl.col("split") == "test")
+    by_scenario = (
+        {
+            scenario: metrics.to_dict()
+            for scenario, metrics in evaluate_gradient_boosting_by_scenario(model, test).items()
+        }
+        if test.height > 0
+        else {}
+    )
+
+    result = {
+        "window_seconds": args.window,
+        "tuning": tuning.to_dict(),
+        "model": model.to_dict(),
+        "metrics_by_split": metrics_by_split,
+        "test_metrics_by_scenario": by_scenario,
+    }
+    out_path = args.dataset_dir / f"gradient_boosting_w{args.window}.json"
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"gradient boosting report written to {out_path}")
+
+    with track_run(
+        "baseline-gradient-boosting",
+        {"window_seconds": args.window, "random_state": args.random_state, **tuning.to_dict()},
+    ) as run:
+        run.log_metrics(metrics_by_split)
+        run.log_artifact(out_path)
+    return 0
+
+
 def _run_evaluate_compare(args: argparse.Namespace) -> int:
     path = args.dataset_dir / f"features_w{args.window}.parquet"
     frame = pl.read_parquet(path)
@@ -778,6 +858,7 @@ _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("baseline", "threshold"): _run_baseline_threshold,
     ("baseline", "isolation-forest"): _run_baseline_isolation_forest,
     ("baseline", "random-forest"): _run_baseline_random_forest,
+    ("baseline", "gradient-boosting"): _run_baseline_gradient_boosting,
     ("evaluate", "compare"): _run_evaluate_compare,
     ("evaluate", "intensity"): _run_evaluate_intensity,
     ("evaluate", "transfer"): _run_evaluate_transfer,
