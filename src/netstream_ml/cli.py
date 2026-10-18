@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -22,6 +23,7 @@ from netstream_ml.baselines import (
 )
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
+from netstream_ml.detector import KafkaDetectorConfig, load_model, run_kafka_detector, save_model
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.external import (
     RECONSTRUCTABLE_FEATURES,
@@ -147,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="each feature's threshold false-alarms on about this share of training benign traffic",
     )
+    threshold.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="also joblib.dump the fitted model here, for `detect run --model`",
+    )
 
     isolation_forest = baseline_subparsers.add_parser(
         "isolation-forest",
@@ -166,6 +174,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     isolation_forest.add_argument("--n-estimators", type=int, default=100)
     isolation_forest.add_argument("--random-state", type=int, default=0)
+    isolation_forest.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="also joblib.dump the fitted model here, for `detect run --model`",
+    )
 
     random_forest = baseline_subparsers.add_parser(
         "random-forest",
@@ -178,6 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     random_forest.add_argument("--window", type=int, default=5, help="window size in seconds")
     random_forest.add_argument("--random-state", type=int, default=0)
+    random_forest.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="also joblib.dump the fitted model here, for `detect run --model`",
+    )
 
     gradient_boosting = baseline_subparsers.add_parser(
         "gradient-boosting",
@@ -190,10 +210,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gradient_boosting.add_argument("--window", type=int, default=5, help="window size in seconds")
     gradient_boosting.add_argument("--random-state", type=int, default=0)
+    gradient_boosting.add_argument(
+        "--save-model",
+        type=Path,
+        default=None,
+        help="also joblib.dump the fitted model here, for `detect run --model`",
+    )
 
     _add_evaluate_subparsers(subparsers)
+    _add_detect_subparsers(subparsers)
 
     return parser
+
+
+def _add_detect_subparsers(
+    subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+) -> None:
+    detect = subparsers.add_parser(
+        "detect", help="the online detector: consume netstream.events.v1, score, produce detections"
+    )
+    detect_subparsers = detect.add_subparsers(dest="detect_command")
+
+    run = detect_subparsers.add_parser(
+        "run",
+        help="consume netstream.events.v1, score completed windows, produce detections",
+    )
+    run.add_argument(
+        "--model",
+        type=Path,
+        required=True,
+        help="a model saved by `baseline ... --save-model` (any baseline works: they all "
+        "share .predict()/.decision_score())",
+    )
+    run.add_argument("--window", type=int, default=5, help="window size in seconds")
+    run.add_argument(
+        "--bootstrap-servers", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    )
+    run.add_argument(
+        "--events-topic", default=os.environ.get("KAFKA_EVENTS_TOPIC", "netstream.events.v1")
+    )
+    run.add_argument(
+        "--detections-topic",
+        default=os.environ.get("KAFKA_DETECTIONS_TOPIC", "netstream.detections.v1"),
+    )
+    run.add_argument(
+        "--consumer-group", default=os.environ.get("KAFKA_CONSUMER_GROUP", "netstream-detector")
+    )
+    run.add_argument(
+        "--idle-flush-seconds",
+        type=float,
+        default=30.0,
+        help="force-close windows that have received no new record in this long, so a "
+        "sensor that goes quiet doesn't leave its last window open forever",
+    )
+    run.add_argument(
+        "--max-messages",
+        type=int,
+        default=None,
+        help="stop after this many Kafka messages (testing/smoke-checks); default: run forever",
+    )
 
 
 def _add_evaluate_subparsers(
@@ -386,6 +461,10 @@ def _run_baseline_threshold(args: argparse.Namespace) -> int:
     ) as run:
         run.log_metrics(metrics_by_split)
         run.log_artifact(out_path)
+
+    if args.save_model is not None:
+        save_model(model, args.save_model)
+        print(f"model saved to {args.save_model}")
     return 0
 
 
@@ -451,6 +530,10 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     ) as run:
         run.log_metrics(metrics_by_split)
         run.log_artifact(out_path)
+
+    if args.save_model is not None:
+        save_model(model, args.save_model)
+        print(f"model saved to {args.save_model}")
     return 0
 
 
@@ -513,6 +596,10 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     ) as run:
         run.log_metrics(metrics_by_split)
         run.log_artifact(out_path)
+
+    if args.save_model is not None:
+        save_model(model, args.save_model)
+        print(f"model saved to {args.save_model}")
     return 0
 
 
@@ -575,6 +662,10 @@ def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
     ) as run:
         run.log_metrics(metrics_by_split)
         run.log_artifact(out_path)
+
+    if args.save_model is not None:
+        save_model(model, args.save_model)
+        print(f"model saved to {args.save_model}")
     return 0
 
 
@@ -851,6 +942,38 @@ def _run_evaluate_transfer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_detect_run(args: argparse.Namespace) -> int:
+    # Without this, detector.py's logger.info (every detection, the
+    # closing latency summary) is silently dropped — INFO is below the
+    # logging module's default root level, and nothing else in this CLI
+    # calls basicConfig since every other command only ever used print().
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if not args.model.exists():
+        print(
+            f"{args.model} does not exist; save one with `baseline ... --save-model`",
+            file=sys.stderr,
+        )
+        return 1
+    model = load_model(args.model)
+    print(f"model loaded from {args.model}")
+    config = KafkaDetectorConfig(
+        model=model,
+        window_seconds=args.window,
+        bootstrap_servers=args.bootstrap_servers,
+        events_topic=args.events_topic,
+        detections_topic=args.detections_topic,
+        consumer_group=args.consumer_group,
+        idle_flush_seconds=args.idle_flush_seconds,
+        max_messages=args.max_messages,
+    )
+    print(
+        f"consuming {args.events_topic} as group {args.consumer_group}, "
+        f"producing to {args.detections_topic}"
+    )
+    run_kafka_detector(config)
+    return 0
+
+
 _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("data", "export"): _run_export,
     ("data", "split"): _run_split,
@@ -862,12 +985,14 @@ _HANDLERS: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
     ("evaluate", "compare"): _run_evaluate_compare,
     ("evaluate", "intensity"): _run_evaluate_intensity,
     ("evaluate", "transfer"): _run_evaluate_transfer,
+    ("detect", "run"): _run_detect_run,
 }
 
 _SUBCOMMAND_ATTR = {
     "data": "data_command",
     "features": "features_command",
     "baseline": "baseline_command",
+    "detect": "detect_command",
     "evaluate": "evaluate_command",
 }
 
