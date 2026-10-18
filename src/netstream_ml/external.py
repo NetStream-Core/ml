@@ -99,9 +99,7 @@ def load_cic_csv(path: Path) -> pl.DataFrame:
     if missing:
         raise ValueError(f"{path}: missing expected CICFlowMeter columns: {missing}")
 
-    selected = raw.select(
-        [pl.col(name).alias(alias) for name, alias in _RAW_COLUMNS.items()]
-    )
+    selected = raw.select([pl.col(name).alias(alias) for name, alias in _RAW_COLUMNS.items()])
     return selected.with_columns(
         _parse_timestamp(selected["ts_raw"]),
         pl.col("dst_port").cast(pl.Int64, strict=False),
@@ -128,9 +126,10 @@ def _parse_timestamp(column: pl.Series) -> pl.Expr:
         parsed = column.str.strip_chars().str.to_datetime(fmt, strict=False)
         nulls = int(parsed.is_null().sum())
         if nulls < best_nulls:
-            best, best_nulls = pl.col("ts_raw").str.strip_chars().str.to_datetime(
-                fmt, strict=False
-            ), nulls
+            best, best_nulls = (
+                pl.col("ts_raw").str.strip_chars().str.to_datetime(fmt, strict=False),
+                nulls,
+            )
     if best is None:
         raise ValueError("could not parse Timestamp column with any known CICFlowMeter format")
     return best.alias("ts")
@@ -146,25 +145,26 @@ def external_window_features(flows: pl.DataFrame, window: WindowSpec) -> pl.Data
     if flows.height == 0:
         return _empty_external_features()
 
-    bucketed = flows.with_columns(
-        ((pl.col("ts").dt.epoch("s") // window.seconds) * window.seconds).alias("window_start"),
-        (pl.col("fwd_packets") + pl.col("bwd_packets")).alias("packets"),
-        pl.col("label_raw")
-        .str.to_lowercase()
-        .str.replace_all(r"\s+", "_")
-        .alias("scenario"),
-    ).with_columns(
-        pl.when(pl.col("label_raw") == BENIGN_LABEL_RAW)
-        .then(pl.lit("benign"))
-        .otherwise(pl.lit("attack"))
-        .alias("label"),
-        (pl.col("packets") - 1).clip(lower_bound=0).alias("iat_count"),
-    ).with_columns(
-        (pl.col("iat_mean_us_raw") * pl.col("iat_count")).alias("iat_sum_us"),
-        (
-            (pl.col("iat_std_us_raw") ** 2 + pl.col("iat_mean_us_raw") ** 2)
-            * pl.col("iat_count")
-        ).alias("iat_sumsq_us"),
+    bucketed = (
+        flows.with_columns(
+            ((pl.col("ts").dt.epoch("s") // window.seconds) * window.seconds).alias("window_start"),
+            (pl.col("fwd_packets") + pl.col("bwd_packets")).alias("packets"),
+            pl.col("label_raw").str.to_lowercase().str.replace_all(r"\s+", "_").alias("scenario"),
+        )
+        .with_columns(
+            pl.when(pl.col("label_raw") == BENIGN_LABEL_RAW)
+            .then(pl.lit("benign"))
+            .otherwise(pl.lit("attack"))
+            .alias("label"),
+            (pl.col("packets") - 1).clip(lower_bound=0).alias("iat_count"),
+        )
+        .with_columns(
+            (pl.col("iat_mean_us_raw") * pl.col("iat_count")).alias("iat_sum_us"),
+            (
+                (pl.col("iat_std_us_raw") ** 2 + pl.col("iat_mean_us_raw") ** 2)
+                * pl.col("iat_count")
+            ).alias("iat_sumsq_us"),
+        )
     )
 
     def _ratio(numerator: pl.Expr, denominator: pl.Expr) -> pl.Expr:
@@ -191,10 +191,7 @@ def external_window_features(flows: pl.DataFrame, window: WindowSpec) -> pl.Data
             _ratio(pl.col("_iat_sum_us"), pl.col("_iat_count")).alias("iat_mean_us"),
         )
         .with_columns(
-            (
-                _ratio(pl.col("_iat_sumsq_us"), pl.col("_iat_count"))
-                - pl.col("iat_mean_us") ** 2
-            )
+            (_ratio(pl.col("_iat_sumsq_us"), pl.col("_iat_count")) - pl.col("iat_mean_us") ** 2)
             .clip(lower_bound=0.0)
             .sqrt()
             .alias("iat_std_us"),
