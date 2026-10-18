@@ -2,6 +2,7 @@ import datetime as dt
 import json
 from pathlib import Path
 
+import onnx
 import polars as pl
 import pytest
 
@@ -360,6 +361,90 @@ def test_baseline_threshold_register_model_publishes_the_saved_artifact(
     assert seen["metadata"].version == "v1"  # type: ignore[attr-defined]
     assert seen["metadata"].algorithm == "threshold"  # type: ignore[attr-defined]
     assert "model registered: threshold@v1" in capsys.readouterr().out
+
+
+def test_baseline_threshold_export_onnx_writes_a_verified_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    onnx_path = tmp_path / "model.onnx"
+
+    exit_code = main(
+        ["baseline", "threshold", str(tmp_path), "--window", "5", "--export-onnx", str(onnx_path)]
+    )
+
+    assert exit_code == 0
+    assert f"model exported to ONNX at {onnx_path}" in capsys.readouterr().out
+    onnx.checker.check_model(onnx.load(onnx_path))
+
+
+def test_baseline_random_forest_export_onnx_writes_a_verified_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    onnx_path = tmp_path / "model.onnx"
+
+    exit_code = main(
+        [
+            "baseline",
+            "random-forest",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--export-onnx",
+            str(onnx_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert f"model exported to ONNX at {onnx_path}" in capsys.readouterr().out
+    onnx.checker.check_model(onnx.load(onnx_path))
+
+
+def test_baseline_isolation_forest_export_onnx_writes_a_verified_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    onnx_path = tmp_path / "model.onnx"
+
+    exit_code = main(
+        [
+            "baseline",
+            "isolation-forest",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--export-onnx",
+            str(onnx_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert f"model exported to ONNX at {onnx_path}" in capsys.readouterr().out
+    onnx.checker.check_model(onnx.load(onnx_path))
+
+
+def test_baseline_gradient_boosting_export_onnx_writes_a_verified_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    onnx_path = tmp_path / "model.onnx"
+
+    exit_code = main(
+        [
+            "baseline",
+            "gradient-boosting",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--export-onnx",
+            str(onnx_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert f"model exported to ONNX at {onnx_path}" in capsys.readouterr().out
+    onnx.checker.check_model(onnx.load(onnx_path))
 
 
 def test_detect_run_fails_clearly_when_the_registry_is_unreachable() -> None:
