@@ -8,6 +8,7 @@ import pytest
 from netstream_ml import __version__, cli
 from netstream_ml.cli import main
 from netstream_ml.clickhouse import ClickHouseConfig
+from netstream_ml.detector import load_model
 
 
 def test_main_without_arguments_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
@@ -259,6 +260,32 @@ def test_baseline_threshold_writes_a_report_with_metrics_by_split(
     assert "train" in report["metrics_by_split"]
     assert "test" in report["test_metrics_by_scenario"] or report["test_metrics_by_scenario"]
     assert "baseline report written to" in capsys.readouterr().out
+
+
+def test_baseline_threshold_save_model_round_trips_through_detect_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+
+    exit_code = main(
+        ["baseline", "threshold", str(tmp_path), "--window", "5", "--save-model", str(model_path)]
+    )
+
+    assert exit_code == 0
+    assert model_path.exists()
+    assert f"model saved to {model_path}" in capsys.readouterr().out
+
+    loaded = load_model(model_path)
+    assert loaded.predict(pl.read_parquet(tmp_path / "features_w5.parquet")) is not None
+
+
+def test_detect_run_fails_clearly_when_the_model_file_is_missing(tmp_path: Path) -> None:
+    exit_code = main(
+        ["detect", "run", "--model", str(tmp_path / "no-such-model.joblib")]
+    )
+
+    assert exit_code == 1
 
 
 def test_baseline_threshold_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
