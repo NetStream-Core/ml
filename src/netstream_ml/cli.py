@@ -33,6 +33,7 @@ from netstream_ml.external import (
 )
 from netstream_ml.features import WindowSpec, build_features
 from netstream_ml.gradient_boosting import (
+    GradientBoostingConfig,
     evaluate_gradient_boosting,
     evaluate_gradient_boosting_by_scenario,
     fit_gradient_boosting,
@@ -771,24 +772,52 @@ def _run_evaluate_compare(args: argparse.Namespace) -> int:
         seeds=args.seeds,
     )
 
+    gb_tuning = tune_gradient_boosting(train, val, random_state=args.seeds[0])
+    gb_model = fit_gradient_boosting(train, gb_tuning.config)
+    gb_pred = gb_model.predict(test)
+    gb_curve = precision_recall_curve(y_test, gb_model.decision_score(test))
+    gb_seeds = seed_sensitivity(
+        lambda seed: evaluate_gradient_boosting(
+            fit_gradient_boosting(
+                train,
+                GradientBoostingConfig(
+                    n_estimators=gb_tuning.config.n_estimators,
+                    max_depth=gb_tuning.config.max_depth,
+                    learning_rate=gb_tuning.config.learning_rate,
+                    random_state=seed,
+                ),
+            ),
+            test,
+        ),
+        seeds=args.seeds,
+    )
+
     threshold_vs_iso = mcnemar_test(y_test, threshold_pred, iso_pred)
     threshold_vs_rf = mcnemar_test(y_test, threshold_pred, rf_pred)
+    threshold_vs_gb = mcnemar_test(y_test, threshold_pred, gb_pred)
     iso_vs_rf = mcnemar_test(y_test, iso_pred, rf_pred)
+    iso_vs_gb = mcnemar_test(y_test, iso_pred, gb_pred)
+    rf_vs_gb = mcnemar_test(y_test, rf_pred, gb_pred)
 
     print(
         f"average_precision: threshold={threshold_curve.average_precision:.3f} "
         f"isolation-forest={iso_curve.average_precision:.3f} "
-        f"random-forest={rf_curve.average_precision:.3f}"
+        f"random-forest={rf_curve.average_precision:.3f} "
+        f"gradient-boosting={gb_curve.average_precision:.3f}"
     )
     print(
         f"F1 across seeds {list(args.seeds)}: "
         f"isolation-forest mean={iso_seeds.mean:.3f} std={iso_seeds.std:.3f}; "
-        f"random-forest mean={rf_seeds.mean:.3f} std={rf_seeds.std:.3f}"
+        f"random-forest mean={rf_seeds.mean:.3f} std={rf_seeds.std:.3f}; "
+        f"gradient-boosting mean={gb_seeds.mean:.3f} std={gb_seeds.std:.3f}"
     )
     print(
         f"threshold vs isolation-forest: p={threshold_vs_iso.p_value:.4f}; "
         f"threshold vs random-forest: p={threshold_vs_rf.p_value:.4f}; "
-        f"isolation-forest vs random-forest: p={iso_vs_rf.p_value:.4f}"
+        f"threshold vs gradient-boosting: p={threshold_vs_gb.p_value:.4f}; "
+        f"isolation-forest vs random-forest: p={iso_vs_rf.p_value:.4f}; "
+        f"isolation-forest vs gradient-boosting: p={iso_vs_gb.p_value:.4f}; "
+        f"random-forest vs gradient-boosting: p={rf_vs_gb.p_value:.4f}"
     )
 
     result = {
@@ -807,10 +836,18 @@ def _run_evaluate_compare(args: argparse.Namespace) -> int:
             "precision_recall_curve": rf_curve.to_dict(),
             "seed_sensitivity": rf_seeds.to_dict(),
         },
+        "gradient_boosting": {
+            "tuning": gb_tuning.to_dict(),
+            "precision_recall_curve": gb_curve.to_dict(),
+            "seed_sensitivity": gb_seeds.to_dict(),
+        },
         "mcnemar": {
             "threshold_vs_isolation_forest": threshold_vs_iso.to_dict(),
             "threshold_vs_random_forest": threshold_vs_rf.to_dict(),
+            "threshold_vs_gradient_boosting": threshold_vs_gb.to_dict(),
             "isolation_forest_vs_random_forest": iso_vs_rf.to_dict(),
+            "isolation_forest_vs_gradient_boosting": iso_vs_gb.to_dict(),
+            "random_forest_vs_gradient_boosting": rf_vs_gb.to_dict(),
         },
     }
     out_path = args.dataset_dir / f"evaluate_compare_w{args.window}.json"

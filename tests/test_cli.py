@@ -536,12 +536,18 @@ def test_evaluate_compare_writes_a_report(
     assert report["threshold"]["precision_recall_curve"]["average_precision"] > 0
     assert len(report["isolation_forest"]["seed_sensitivity"]["values"]) == 2
     assert len(report["random_forest"]["seed_sensitivity"]["values"]) == 2
+    assert len(report["gradient_boosting"]["seed_sensitivity"]["values"]) == 2
     assert "candidates_tried" in report["random_forest"]["tuning"]
+    assert "candidates_tried" in report["gradient_boosting"]["tuning"]
     assert "threshold_vs_isolation_forest" in report["mcnemar"]
     assert "threshold_vs_random_forest" in report["mcnemar"]
+    assert "threshold_vs_gradient_boosting" in report["mcnemar"]
     assert "isolation_forest_vs_random_forest" in report["mcnemar"]
+    assert "isolation_forest_vs_gradient_boosting" in report["mcnemar"]
+    assert "random_forest_vs_gradient_boosting" in report["mcnemar"]
     out = capsys.readouterr().out
     assert "average_precision" in out
+    assert "gradient-boosting" in out
     assert "comparison report written to" in out
 
 
