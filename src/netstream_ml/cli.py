@@ -49,7 +49,7 @@ from netstream_ml.model_registry import (
     publish_model,
 )
 from netstream_ml.model_registry import load_model as load_model_from_registry
-from netstream_ml.onnx_export import run_onnx, to_onnx
+from netstream_ml.onnx_export import load_onnx_baseline, run_onnx, save_onnx_model, to_onnx
 from netstream_ml.split import (
     SplitConfig,
     SplitRatios,
@@ -258,8 +258,9 @@ def _add_detect_subparsers(
     )
     run.add_argument(
         "--model-name",
-        required=True,
-        help="a model registered via `baseline ... --save-model ... --register-model NAME`",
+        default=None,
+        help="a model registered via `baseline ... --save-model ... --register-model NAME` "
+        "(exactly one of --model-name or --onnx-model is required)",
     )
     run.add_argument(
         "--model-version",
@@ -268,6 +269,13 @@ def _add_detect_subparsers(
     )
     run.add_argument(
         "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
+    )
+    run.add_argument(
+        "--onnx-model",
+        type=Path,
+        default=None,
+        help="a local file written by `baseline ... --export-onnx`, as an alternative to "
+        "--model-name's registry lookup (exactly one of the two is required)",
     )
     run.add_argument("--window", type=int, default=5, help="window size in seconds")
     run.add_argument(
@@ -490,7 +498,7 @@ def _maybe_export_onnx(args: argparse.Namespace, model: Baseline, test: pl.DataF
             )
             return 1
 
-    args.export_onnx.write_bytes(onnx_model.SerializeToString())
+    save_onnx_model(onnx_model, args.export_onnx)
     print(f"model exported to ONNX at {args.export_onnx}")
     return 0
 
@@ -1079,14 +1087,27 @@ def _run_detect_run(args: argparse.Namespace) -> int:
     # logging module's default root level, and nothing else in this CLI
     # calls basicConfig since every other command only ever used print().
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    registry = RegistryConfig(backend_url=args.backend_url)
-    try:
-        version = args.model_version or latest_version(registry, args.model_name)
-        model = load_model_from_registry(registry, args.model_name, version)
-    except RegistryError as error:
-        print(str(error), file=sys.stderr)
+    if (args.model_name is None) == (args.onnx_model is None):
+        print("exactly one of --model-name or --onnx-model is required", file=sys.stderr)
         return 1
-    print(f"model loaded: {args.model_name}@{version} from {args.backend_url}")
+
+    if args.onnx_model is not None:
+        try:
+            model: Baseline = load_onnx_baseline(args.onnx_model)
+        except (ValueError, OSError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(f"model loaded: {args.onnx_model} (ONNX)")
+    else:
+        registry = RegistryConfig(backend_url=args.backend_url)
+        try:
+            version = args.model_version or latest_version(registry, args.model_name)
+            model = load_model_from_registry(registry, args.model_name, version)
+        except RegistryError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(f"model loaded: {args.model_name}@{version} from {args.backend_url}")
+
     config = KafkaDetectorConfig(
         model=model,
         window_seconds=args.window,

@@ -1,10 +1,13 @@
+from pathlib import Path
+
 import numpy as np
 import polars as pl
+import pytest
 
 from netstream_ml.anomaly import IsolationForestConfig, fit_isolation_forest
 from netstream_ml.baselines import fit_threshold_baseline
 from netstream_ml.gradient_boosting import GradientBoostingConfig, fit_gradient_boosting
-from netstream_ml.onnx_export import run_onnx, to_onnx
+from netstream_ml.onnx_export import load_onnx_baseline, run_onnx, save_onnx_model, to_onnx
 from netstream_ml.supervised import RandomForestConfig, fit_random_forest
 
 
@@ -108,3 +111,40 @@ def test_gradient_boosting_onnx_matches_the_original() -> None:
     assert kind == "gradient_boosting"
     assert list(baseline.predict(frame)) == list(onnx_predict)
     np.testing.assert_allclose(baseline.decision_score(frame).to_numpy(), onnx_score, atol=1e-4)
+
+
+def test_load_onnx_baseline_round_trips_as_a_working_baseline(tmp_path: Path) -> None:
+    frame = _correlated_frame()
+    baseline = fit_random_forest(
+        frame, RandomForestConfig(features=("packets_total", "unique_dst_ports"), random_state=0)
+    )
+    model, _, _ = to_onnx(baseline)
+    path = tmp_path / "model.onnx"
+    save_onnx_model(model, path)
+
+    loaded = load_onnx_baseline(path)
+
+    assert loaded.kind == "random_forest"
+    assert loaded.feature_order == ("packets_total", "unique_dst_ports")
+    assert list(loaded.predict(frame)) == list(baseline.predict(frame))
+    np.testing.assert_allclose(
+        loaded.decision_score(frame).to_numpy(),
+        baseline.decision_score(frame).to_numpy(),
+        atol=1e-4,
+    )
+
+
+def test_load_onnx_baseline_fails_clearly_on_a_model_without_netstream_ml_metadata(
+    tmp_path: Path,
+) -> None:
+    frame = _correlated_frame()
+    baseline = fit_random_forest(
+        frame, RandomForestConfig(features=("packets_total", "unique_dst_ports"), random_state=0)
+    )
+    model, _, _ = to_onnx(baseline)
+    del model.metadata_props[:]
+    path = tmp_path / "bare.onnx"
+    path.write_bytes(model.SerializeToString())
+
+    with pytest.raises(ValueError, match="netstream_ml"):
+        load_onnx_baseline(path)
