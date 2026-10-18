@@ -20,6 +20,9 @@ run time.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -37,6 +40,9 @@ from netstream_ml.baselines import ThresholdBaseline
 from netstream_ml.detector import Baseline
 from netstream_ml.gradient_boosting import GradientBoostingBaseline
 from netstream_ml.supervised import RandomForestBaseline
+
+_KIND_KEY = "netstream_ml_kind"
+_FEATURE_ORDER_KEY = "netstream_ml_feature_order"
 
 _OPSET = 18
 # onnxruntime pinned here tops out at IR version 13; the onnx package
@@ -209,55 +215,61 @@ def _skl_to_onnx(estimator: object, n_features: int) -> onnx.ModelProto:
     )
 
 
+def _with_metadata(
+    model: onnx.ModelProto, feature_order: tuple[str, ...], kind: str
+) -> onnx.ModelProto:
+    """Stamps `kind` and `feature_order` onto the model itself (ONNX's
+    `metadata_props`, a plain string/string map every runtime preserves),
+    so a `.onnx` file on disk is self-describing — `load_onnx_baseline`
+    does not need a sidecar file to know how to run it."""
+    model.metadata_props.append(onnx.StringStringEntryProto(key=_KIND_KEY, value=kind))
+    model.metadata_props.append(
+        onnx.StringStringEntryProto(key=_FEATURE_ORDER_KEY, value=json.dumps(feature_order))
+    )
+    return model
+
+
 def to_onnx(baseline: Baseline) -> tuple[onnx.ModelProto, tuple[str, ...], str]:
     """Converts any of the four baselines to ONNX. Returns the model, the
     column order it expects its input tensor in, and a `kind` tag that
-    `run_onnx` needs to know how to read that specific converter's
-    output convention back into `predict`/`decision_score`."""
+    `run_onnx`/`load_onnx_baseline` need to know how to read that specific
+    converter's output convention back into `predict`/`decision_score`.
+    Both are also stamped onto the returned model's `metadata_props`."""
     if isinstance(baseline, ThresholdBaseline):
         model, feature_order = _threshold_to_onnx(baseline)
-        return model, feature_order, "threshold"
-    if isinstance(baseline, IsolationForestBaseline):
-        return (
-            _skl_to_onnx(baseline.model, len(baseline.features)),
-            baseline.features,
-            "isolation_forest",
+        kind = "threshold"
+    elif isinstance(baseline, IsolationForestBaseline):
+        model = _skl_to_onnx(baseline.model, len(baseline.features))
+        feature_order, kind = baseline.features, "isolation_forest"
+    elif isinstance(baseline, RandomForestBaseline):
+        model = _skl_to_onnx(baseline.model, len(baseline.features))
+        feature_order, kind = baseline.features, "random_forest"
+    elif isinstance(baseline, GradientBoostingBaseline):
+        model = _finalize(
+            convert_xgboost(
+                baseline.model,
+                initial_types=[("input", FloatTensorType([None, len(baseline.features)]))],
+            )
         )
-    if isinstance(baseline, RandomForestBaseline):
-        return (
-            _skl_to_onnx(baseline.model, len(baseline.features)),
-            baseline.features,
-            "random_forest",
-        )
-    if isinstance(baseline, GradientBoostingBaseline):
-        model = convert_xgboost(
-            baseline.model,
-            initial_types=[("input", FloatTensorType([None, len(baseline.features)]))],
-        )
-        return _finalize(model), baseline.features, "gradient_boosting"
-    raise TypeError(f"no ONNX conversion for {type(baseline).__name__}")
-
-
-def run_onnx(
-    model: onnx.ModelProto, frame: pl.DataFrame, feature_order: tuple[str, ...], kind: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Runs the exported graph the same way `OnlineDetector` would: select
-    `feature_order`'s columns in that exact order and fill nulls with 0
-    (same imputation every baseline's own `.predict`/`.decision_score`
-    already does). Returns `(predict, score)` as flat numpy arrays, in the
-    same convention as the original baseline — not whatever convention the
-    particular ONNX converter for `kind` happened to pick."""
-    if feature_order:
-        matrix = frame.select(list(feature_order)).fill_null(0).to_numpy().astype(np.float32)
+        feature_order, kind = baseline.features, "gradient_boosting"
     else:
-        # A ThresholdBaseline with no rules still declares a one-column
-        # dummy input (ONNX graphs can't take a zero-width tensor) — its
-        # value is never read, only the row count matters.
-        matrix = np.zeros((frame.height, 1), dtype=np.float32)
-    session = rt.InferenceSession(model.SerializeToString())
-    names = [o.name for o in session.get_outputs()]
-    outputs = dict(zip(names, session.run(None, {"input": matrix}), strict=True))
+        raise TypeError(f"no ONNX conversion for {type(baseline).__name__}")
+    return _with_metadata(model, feature_order, kind), feature_order, kind
 
+
+def _frame_to_matrix(frame: pl.DataFrame, feature_order: tuple[str, ...]) -> np.ndarray:
+    if feature_order:
+        return frame.select(list(feature_order)).fill_null(0).to_numpy().astype(np.float32)
+    # A ThresholdBaseline with no rules still declares a one-column dummy
+    # input (ONNX graphs can't take a zero-width tensor) — its value is
+    # never read, only the row count matters.
+    return np.zeros((frame.height, 1), dtype=np.float32)
+
+
+def _decode_outputs(outputs: dict[str, object], kind: str) -> tuple[np.ndarray, np.ndarray]:
+    """Reads one ONNX session's raw outputs back into `(predict, score)` in
+    the original baseline's own convention — not whatever convention the
+    particular converter for `kind` happened to pick."""
     if kind == "threshold":
         predict = np.asarray(outputs["predict"]).reshape(-1).astype(bool)
         score = np.asarray(outputs["score"]).reshape(-1).astype(np.float64)
@@ -289,3 +301,61 @@ def run_onnx(
         return predict, score
 
     raise ValueError(f"unknown ONNX export kind: {kind!r}")
+
+
+def run_onnx(
+    model: onnx.ModelProto, frame: pl.DataFrame, feature_order: tuple[str, ...], kind: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """One-shot helper for a single comparison (CLI self-verification,
+    tests): builds a fresh `InferenceSession` every call. `OnnxBaseline`
+    below keeps the session alive instead, for repeated use in the online
+    detector's hot path."""
+    matrix = _frame_to_matrix(frame, feature_order)
+    session = rt.InferenceSession(model.SerializeToString())
+    names = [o.name for o in session.get_outputs()]
+    outputs = dict(zip(names, session.run(None, {"input": matrix}), strict=True))
+    return _decode_outputs(outputs, kind)
+
+
+@dataclass(frozen=True, slots=True)
+class OnnxBaseline:
+    """A `Baseline` backed by an ONNX Runtime session instead of the
+    original sklearn/XGBoost/rules object — same `.predict`/
+    `.decision_score` interface `OnlineDetector` already depends on, so
+    `detect run --onnx-model` is a drop-in alternative to the registry's
+    `joblib` artifact, not a separate code path through the detector."""
+
+    session: rt.InferenceSession
+    feature_order: tuple[str, ...]
+    kind: str
+
+    def _run(self, frame: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        matrix = _frame_to_matrix(frame, self.feature_order)
+        names = [o.name for o in self.session.get_outputs()]
+        outputs = dict(zip(names, self.session.run(None, {"input": matrix}), strict=True))
+        return _decode_outputs(outputs, self.kind)
+
+    def predict(self, frame: pl.DataFrame) -> pl.Series:
+        predict, _ = self._run(frame)
+        return pl.Series("predicted", predict)
+
+    def decision_score(self, frame: pl.DataFrame) -> pl.Series:
+        _, score = self._run(frame)
+        return pl.Series("score", score)
+
+
+def save_onnx_model(model: onnx.ModelProto, path: Path) -> None:
+    path.write_bytes(model.SerializeToString())
+
+
+def load_onnx_baseline(path: Path) -> OnnxBaseline:
+    model = onnx.load(path)
+    metadata = {entry.key: entry.value for entry in model.metadata_props}
+    if _KIND_KEY not in metadata or _FEATURE_ORDER_KEY not in metadata:
+        raise ValueError(
+            f"{path} has no netstream_ml ONNX metadata — it wasn't written by "
+            "`netstream_ml.onnx_export.to_onnx`, or predates it"
+        )
+    feature_order = tuple(json.loads(metadata[_FEATURE_ORDER_KEY]))
+    session = rt.InferenceSession(model.SerializeToString())
+    return OnnxBaseline(session=session, feature_order=feature_order, kind=metadata[_KIND_KEY])

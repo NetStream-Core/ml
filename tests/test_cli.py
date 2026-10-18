@@ -484,6 +484,48 @@ def test_detect_run_loads_the_named_model_and_starts_the_kafka_loop(
     assert "model loaded: threshold@v2 from http://backend:8080" in capsys.readouterr().out
 
 
+def test_detect_run_loads_a_local_onnx_model_instead_of_the_registry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"not read, just checked for existence by the fake loader")
+
+    monkeypatch.setattr(cli, "load_onnx_baseline", lambda path: "fake-onnx-model")
+
+    def fake_run_kafka_detector(config: object) -> None:
+        seen["config"] = config
+
+    monkeypatch.setattr(cli, "run_kafka_detector", fake_run_kafka_detector)
+
+    exit_code = main(["detect", "run", "--onnx-model", str(onnx_path)])
+
+    assert exit_code == 0
+    assert seen["config"].model == "fake-onnx-model"  # type: ignore[attr-defined]
+    assert f"model loaded: {onnx_path} (ONNX)" in capsys.readouterr().out
+
+
+def test_detect_run_rejects_both_model_name_and_onnx_model(tmp_path: Path) -> None:
+    exit_code = main(
+        [
+            "detect",
+            "run",
+            "--model-name",
+            "threshold",
+            "--onnx-model",
+            str(tmp_path / "model.onnx"),
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_detect_run_rejects_neither_model_name_nor_onnx_model() -> None:
+    exit_code = main(["detect", "run"])
+
+    assert exit_code == 1
+
+
 def test_baseline_threshold_fails_clearly_without_a_split_column(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     pl.DataFrame({"packets_total": [1, 2], "label": ["benign", "benign"]}).write_parquet(
