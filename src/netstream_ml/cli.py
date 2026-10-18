@@ -6,6 +6,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from netstream_ml import __version__
@@ -23,7 +24,7 @@ from netstream_ml.baselines import (
 )
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
-from netstream_ml.detector import KafkaDetectorConfig, run_kafka_detector, save_model
+from netstream_ml.detector import Baseline, KafkaDetectorConfig, run_kafka_detector, save_model
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.external import (
     RECONSTRUCTABLE_FEATURES,
@@ -47,6 +48,7 @@ from netstream_ml.model_registry import (
     publish_model,
 )
 from netstream_ml.model_registry import load_model as load_model_from_registry
+from netstream_ml.onnx_export import run_onnx, to_onnx
 from netstream_ml.split import (
     SplitConfig,
     SplitRatios,
@@ -85,6 +87,13 @@ def _add_save_model_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
+    )
+    parser.add_argument(
+        "--export-onnx",
+        type=Path,
+        default=None,
+        help="also convert the fitted model to ONNX and write it here, after verifying "
+        "predict/decision_score match the original on the test split",
     )
 
 
@@ -456,6 +465,35 @@ def _maybe_register_model(
     return 0
 
 
+def _maybe_export_onnx(args: argparse.Namespace, model: Baseline, test: pl.DataFrame) -> int:
+    if args.export_onnx is None:
+        return 0
+
+    try:
+        onnx_model, feature_order, kind = to_onnx(model)
+    except TypeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    if test.height > 0:
+        onnx_predict, onnx_score = run_onnx(onnx_model, test, feature_order, kind)
+        original_predict = model.predict(test).to_numpy()
+        original_score = model.decision_score(test).to_numpy()
+        if not np.array_equal(onnx_predict, original_predict) or not np.allclose(
+            onnx_score, original_score, atol=1e-4
+        ):
+            print(
+                "ONNX export does not match the original model's predict/decision_score "
+                "on the test split; refusing to write a silently wrong file",
+                file=sys.stderr,
+            )
+            return 1
+
+    args.export_onnx.write_bytes(onnx_model.SerializeToString())
+    print(f"model exported to ONNX at {args.export_onnx}")
+    return 0
+
+
 def _run_baseline_threshold(args: argparse.Namespace) -> int:
     path = args.dataset_dir / f"features_w{args.window}.parquet"
     frame = pl.read_parquet(path)
@@ -511,7 +549,10 @@ def _run_baseline_threshold(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return _maybe_register_model(args, "threshold", metrics_by_split)
+    register_exit_code = _maybe_register_model(args, "threshold", metrics_by_split)
+    if register_exit_code != 0:
+        return register_exit_code
+    return _maybe_export_onnx(args, model, test)
 
 
 def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
@@ -580,7 +621,10 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return _maybe_register_model(args, "isolation-forest", metrics_by_split)
+    register_exit_code = _maybe_register_model(args, "isolation-forest", metrics_by_split)
+    if register_exit_code != 0:
+        return register_exit_code
+    return _maybe_export_onnx(args, model, test)
 
 
 def _run_baseline_random_forest(args: argparse.Namespace) -> int:
@@ -646,7 +690,10 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return _maybe_register_model(args, "random-forest", metrics_by_split)
+    register_exit_code = _maybe_register_model(args, "random-forest", metrics_by_split)
+    if register_exit_code != 0:
+        return register_exit_code
+    return _maybe_export_onnx(args, model, test)
 
 
 def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
@@ -712,7 +759,10 @@ def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
     if args.save_model is not None:
         save_model(model, args.save_model)
         print(f"model saved to {args.save_model}")
-    return _maybe_register_model(args, "gradient-boosting", metrics_by_split)
+    register_exit_code = _maybe_register_model(args, "gradient-boosting", metrics_by_split)
+    if register_exit_code != 0:
+        return register_exit_code
+    return _maybe_export_onnx(args, model, test)
 
 
 def _run_evaluate_compare(args: argparse.Namespace) -> int:

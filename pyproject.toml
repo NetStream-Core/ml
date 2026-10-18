@@ -14,6 +14,9 @@ dependencies = [
     "xgboost>=3.4.1",
     "confluent-kafka>=2.16.0",
     "opentelemetry-proto>=1.45.0",
+    "skl2onnx>=1.20.0",
+    "onnxmltools>=1.16.0",
+    "onnxruntime>=1.31.0",
 ]
 
 [project.scripts]
@@ -63,4 +66,16 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "confluent_kafka.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "onnxruntime.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "onnxmltools.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "skl2onnx.*"
 ignore_missing_imports = true
