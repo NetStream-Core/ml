@@ -53,9 +53,7 @@ _FLOW_ATTRS: dict[str, object] = {
 }
 
 
-def _flow_payload(
-    src_ip: str, time_unix_nano: int, host_id: str = "sensor-1"
-) -> bytes:
+def _flow_payload(src_ip: str, time_unix_nano: int, host_id: str = "sensor-1") -> bytes:
     attrs = {**_FLOW_ATTRS, "source.address": src_ip}
     resource = Resource(attributes=[_kv("host.id", host_id)])
     log_record = LogRecord(
@@ -128,9 +126,7 @@ def test_process_message_reports_increasing_latency_for_an_older_window() -> Non
     online.process_message(_flow_payload("10.0.0.5", _ns(1_700_000_000)))
 
     now = dt.datetime.fromtimestamp(1_700_000_020, tz=dt.UTC)
-    results = online.process_message(
-        _flow_payload("10.0.0.5", _ns(1_700_000_010)), now=now
-    )
+    results = online.process_message(_flow_payload("10.0.0.5", _ns(1_700_000_010)), now=now)
 
     assert len(results) == 1
     assert results[0].latency_ms > 0

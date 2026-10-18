@@ -106,9 +106,7 @@ class OnlineDetector:
         results = []
         for row, is_attack, score in zip(windows, predictions, scores, strict=True):
             window_start = cast(int, row["window_start"])
-            window_end = dt.datetime.fromtimestamp(
-                window_start + self._window.seconds, tz=dt.UTC
-            )
+            window_end = dt.datetime.fromtimestamp(window_start + self._window.seconds, tz=dt.UTC)
             latency_ms = (now - window_end).total_seconds() * 1000
             results.append(
                 DetectionResult(
@@ -233,6 +231,4 @@ def run_kafka_detector(config: KafkaDetectorConfig) -> None:
         consumer.close()
         if latencies:
             p50, p95 = _latency_percentiles(latencies)
-            logger.info(
-                "latency_ms p50=%.1f p95=%.1f over %d detections", p50, p95, len(latencies)
-            )
+            logger.info("latency_ms p50=%.1f p95=%.1f over %d detections", p50, p95, len(latencies))
