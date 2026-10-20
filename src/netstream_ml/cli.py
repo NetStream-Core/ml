@@ -79,12 +79,20 @@ def _add_save_model_args(parser: argparse.ArgumentParser) -> None:
         "--register-model",
         default=None,
         help="also register --save-model's artifact with the backend's model registry under "
-        "this name, for `detect run --model-name` (requires --save-model and --model-version)",
+        "this name, for `detect run --model-name` (requires --save-model, --model-version "
+        "and --signing-key)",
     )
     parser.add_argument(
         "--model-version",
         default=None,
         help="version string for --register-model (e.g. a git SHA or a date)",
+    )
+    parser.add_argument(
+        "--signing-key",
+        type=Path,
+        default=None,
+        help="Ed25519 private key (PEM) to sign --register-model's artifact with — "
+        "`detect run --model-name` refuses to load an artifact with no valid signature",
     )
     parser.add_argument(
         "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
@@ -266,6 +274,13 @@ def _add_detect_subparsers(
         "--model-version",
         default=None,
         help="defaults to the newest version registered for --model-name",
+    )
+    run.add_argument(
+        "--verify-key",
+        type=Path,
+        default=None,
+        help="Ed25519 public key (PEM) to verify --model-name's artifact signature against "
+        "before loading it (required together with --model-name)",
     )
     run.add_argument(
         "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
@@ -456,6 +471,9 @@ def _maybe_register_model(
     if args.model_version is None:
         print("--register-model requires --model-version", file=sys.stderr)
         return 1
+    if args.signing_key is None:
+        print("--register-model requires --signing-key", file=sys.stderr)
+        return 1
 
     registry = RegistryConfig(backend_url=args.backend_url)
     metadata = ModelMetadata(
@@ -466,7 +484,7 @@ def _maybe_register_model(
         metrics=metrics_by_split,
     )
     try:
-        publish_model(registry, args.save_model, metadata)
+        publish_model(registry, args.save_model, metadata, args.signing_key)
     except RegistryError as error:
         print(str(error), file=sys.stderr)
         return 1
@@ -1099,10 +1117,13 @@ def _run_detect_run(args: argparse.Namespace) -> int:
             return 1
         print(f"model loaded: {args.onnx_model} (ONNX)")
     else:
+        if args.verify_key is None:
+            print("--model-name requires --verify-key", file=sys.stderr)
+            return 1
         registry = RegistryConfig(backend_url=args.backend_url)
         try:
             version = args.model_version or latest_version(registry, args.model_name)
-            model = load_model_from_registry(registry, args.model_name, version)
+            model = load_model_from_registry(registry, args.model_name, version, args.verify_key)
         except RegistryError as error:
             print(str(error), file=sys.stderr)
             return 1
