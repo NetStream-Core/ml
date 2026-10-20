@@ -319,6 +319,13 @@ def _add_detect_subparsers(
         default=None,
         help="stop after this many Kafka messages (testing/smoke-checks); default: run forever",
     )
+    run.add_argument(
+        "--produce-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="how long to wait for a batch of detections to be acked by the broker before "
+        "giving up and not committing the input offset that produced them",
+    )
 
 
 def _add_evaluate_subparsers(
@@ -1138,6 +1145,7 @@ def _run_detect_run(args: argparse.Namespace) -> int:
         consumer_group=args.consumer_group,
         idle_flush_seconds=args.idle_flush_seconds,
         max_messages=args.max_messages,
+        produce_timeout_seconds=args.produce_timeout_seconds,
     )
     print(
         f"consuming {args.events_topic} as group {args.consumer_group}, "

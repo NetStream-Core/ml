@@ -162,6 +162,24 @@ class OnlineDetector:
         return results
 
 
+def _commit_if_anything_to_commit(consumer: confluent_kafka.Consumer) -> None:
+    """A bare `commit()` (no `message=`) commits whatever this consumer
+    handle has stored since its last commit — which, since every message
+    offset is stored via the per-message `commit(message=msg, ...)` call
+    right after a successful publish, is normally nothing by the time the
+    idle-flush or shutdown path gets here. confluent_kafka raises
+    `_NO_OFFSET` for that case instead of treating it as a no-op; without
+    this guard, an idle period with nothing new to force-close (or a
+    shutdown right after the last per-message commit) crashes the whole
+    detector."""
+    try:
+        consumer.commit(asynchronous=False)
+    except confluent_kafka.KafkaException as exc:
+        error = exc.args[0]
+        if not (hasattr(error, "code") and error.code() == confluent_kafka.KafkaError._NO_OFFSET):
+            raise
+
+
 def _latency_percentiles(latencies: list[float]) -> tuple[float, float]:
     ordered = sorted(latencies)
     p50 = ordered[len(ordered) // 2]
@@ -179,6 +197,69 @@ class KafkaDetectorConfig:
     consumer_group: str
     idle_flush_seconds: float
     max_messages: int | None = None
+    # How long to wait for a batch of detections to be durably acked by the
+    # broker before giving up and treating the publish as failed (see
+    # `_produce` below) — not how long `flush()` blocks on every call, just
+    # the ceiling for one.
+    produce_timeout_seconds: float = 10.0
+
+
+def _detection_key(result: DetectionResult) -> bytes:
+    """A deterministic identity for one scored window, independent of how
+    many times it gets reprocessed and re-published (committed-then-crashed
+    input offsets, a consumer rebalance, a manual replay) — a downstream
+    reader that wants to dedupe `netstream.detections.v1` can key on this
+    (or just on the fields it is built from: host_id/src_ip/window_start/
+    window_seconds, already in `DetectionResult.to_dict()`) rather than
+    assuming one message per window."""
+    key = f"{result.host_id}:{result.src_ip}:{result.window_start}:{result.window_seconds}"
+    return key.encode()
+
+
+def _produce_detections(
+    producer: confluent_kafka.Producer,
+    detections_topic: str,
+    results: list[DetectionResult],
+    timeout_seconds: float,
+    latencies: list[float],
+) -> bool:
+    """Publishes every result and blocks until the broker has acked all of
+    them (or `timeout_seconds` runs out). Returns whether every single one
+    was actually delivered — the caller must not commit the input offset
+    that produced `results` unless this is `True`, or a delivery failure
+    becomes a silent, uncommittable loss instead of "will be retried on
+    the next poll"."""
+    if not results:
+        return True
+    delivered = True
+
+    def _on_delivery(err: object, _msg: object) -> None:
+        nonlocal delivered
+        if err is not None:
+            delivered = False
+            logger.error("Failed to publish detection to %s: %s", detections_topic, err)
+
+    for result in results:
+        producer.produce(
+            detections_topic,
+            json.dumps(result.to_dict()).encode(),
+            key=_detection_key(result),
+            callback=_on_delivery,
+        )
+        latencies.append(result.latency_ms)
+        if result.is_attack:
+            logger.info("detection: %s", result.to_dict())
+
+    remaining = producer.flush(timeout_seconds)
+    if remaining > 0:
+        delivered = False
+        logger.error(
+            "%d detection(s) still unacknowledged after %.1fs; not committing the input "
+            "offset for them",
+            remaining,
+            timeout_seconds,
+        )
+    return delivered
 
 
 def run_kafka_detector(config: KafkaDetectorConfig) -> None:
@@ -187,6 +268,20 @@ def run_kafka_detector(config: KafkaDetectorConfig) -> None:
     and that is where the actual decoding/windowing/scoring logic lives;
     this function is a thin wrapper, the same split the rest of the
     project draws between pure logic and run loops.
+
+    Input offsets are committed manually, only after the detections that
+    message produced have been durably published — `enable.auto.commit`
+    (the default) would let the consumer group checkpoint an offset before
+    `producer.produce()`'s calls actually reach the broker, so a crash
+    between the two could commit an input message whose detection was
+    never really published, losing it silently. `enable.idempotence` on
+    the producer guards the other direction: a retried `produce()` (after
+    a transient broker error) can't create a duplicate message on the
+    broker side. Neither guards against *this process* reprocessing the
+    same window after a crash before it managed to commit — that still
+    produces a duplicate `DetectionResult`, which is why `_detection_key`
+    gives it a stable identity a downstream reader can dedupe on, instead
+    of pretending re-delivery can't happen.
     """
     online = OnlineDetector(config.model, WindowSpec(config.window_seconds))
     consumer = confluent_kafka.Consumer(
@@ -194,18 +289,18 @@ def run_kafka_detector(config: KafkaDetectorConfig) -> None:
             "bootstrap.servers": config.bootstrap_servers,
             "group.id": config.consumer_group,
             "auto.offset.reset": "latest",
+            "enable.auto.commit": False,
         }
     )
-    producer = confluent_kafka.Producer({"bootstrap.servers": config.bootstrap_servers})
+    producer = confluent_kafka.Producer(
+        {"bootstrap.servers": config.bootstrap_servers, "enable.idempotence": True}
+    )
     consumer.subscribe([config.events_topic])
 
-    def _produce(results: list[DetectionResult]) -> None:
-        for result in results:
-            producer.produce(config.detections_topic, json.dumps(result.to_dict()).encode())
-            latencies.append(result.latency_ms)
-            if result.is_attack:
-                logger.info("detection: %s", result.to_dict())
-        producer.poll(0)
+    def _produce(results: list[DetectionResult]) -> bool:
+        return _produce_detections(
+            producer, config.detections_topic, results, config.produce_timeout_seconds, latencies
+        )
 
     latencies: list[float] = []
     processed = 0
@@ -218,16 +313,26 @@ def run_kafka_detector(config: KafkaDetectorConfig) -> None:
                 if msg.error():
                     logger.warning("Kafka consumer error: %s", msg.error())
                 elif value is not None:
-                    _produce(online.process_message(value))
+                    if _produce(online.process_message(value)):
+                        consumer.commit(message=msg, asynchronous=False)
+                    else:
+                        logger.error(
+                            "Not committing offset %d for %s/%d: detections may be "
+                            "reprocessed and republished (see _detection_key)",
+                            msg.offset(),
+                            msg.topic(),
+                            msg.partition(),
+                        )
                     processed += 1
 
             now = time.monotonic()
             if now - last_flush >= config.idle_flush_seconds:
-                _produce(online.flush())
+                if _produce(online.flush()):
+                    _commit_if_anything_to_commit(consumer)
                 last_flush = now
     finally:
-        _produce(online.flush())
-        producer.flush(5.0)
+        if _produce(online.flush()):
+            _commit_if_anything_to_commit(consumer)
         consumer.close()
         if latencies:
             p50, p95 = _latency_percentiles(latencies)
