@@ -23,7 +23,7 @@ from netstream_ml.detector import Baseline
 
 @dataclass(frozen=True, slots=True)
 class RegistryConfig:
-    backend_url: str = "http://127.0.0.1:8080"
+    backend_url: str = "http://127.0.0.1:9999"
     timeout: float = 30.0
 
 

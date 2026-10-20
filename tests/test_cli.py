@@ -17,6 +17,22 @@ def test_main_without_arguments_prints_help(capsys: pytest.CaptureFixture[str]) 
     assert "usage: netstream-ml" in capsys.readouterr().out
 
 
+def test_detect_run_backend_url_defaults_to_backend_s_own_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+    args = cli.build_parser().parse_args(["detect", "run", "--model-name", "threshold"])
+    assert args.backend_url == "http://127.0.0.1:9999"
+
+
+def test_baseline_register_model_backend_url_defaults_to_backend_s_own_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+    args = cli.build_parser().parse_args(["baseline", "threshold", "data/v1"])
+    assert args.backend_url == "http://127.0.0.1:9999"
+
+
 def test_version_flag_reports_package_version(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as raised:
         main(["--version"])
