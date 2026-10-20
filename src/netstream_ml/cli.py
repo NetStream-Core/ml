@@ -95,7 +95,7 @@ def _add_save_model_args(parser: argparse.ArgumentParser) -> None:
         "`detect run --model-name` refuses to load an artifact with no valid signature",
     )
     parser.add_argument(
-        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
+        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:9999")
     )
     parser.add_argument(
         "--export-onnx",
@@ -283,7 +283,7 @@ def _add_detect_subparsers(
         "before loading it (required together with --model-name)",
     )
     run.add_argument(
-        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:8080")
+        "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:9999")
     )
     run.add_argument(
         "--onnx-model",

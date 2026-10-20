@@ -49,6 +49,15 @@ class FakeResponse:
         return None
 
 
+def test_registry_config_default_backend_url_matches_backend_s_own_default_port() -> None:
+    """backend's own default (`SERVER_PORT` in internal/config/server.go)
+    is 9999 — this regression-tests that `ml` doesn't silently drift back
+    to a mismatched default (it did: this client used to default to 8080,
+    and `netstream-ml ... --backend-url` unset would never reach a backend
+    started with no explicit `SERVER_PORT`)."""
+    assert model_registry.RegistryConfig().backend_url == "http://127.0.0.1:9999"
+
+
 def test_list_models_parses_the_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "netstream_ml.model_registry.urllib_request.urlopen",
