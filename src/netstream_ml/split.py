@@ -77,6 +77,14 @@ def _hash_assign(key: str, seed: int, ratios: SplitRatios) -> str:
 
 
 def _largest_remainder(n: int, ratios: SplitRatios) -> tuple[int, int, int]:
+    """Plain largest-remainder: proportional counts, rounded, remainder
+    assigned to the largest fractional parts. With few runs and a small
+    test/val ratio, this can starve a split entirely — e.g. 3 runs at
+    60/20/20 gives (2, 1, 0): val and test's fractional parts (0.6 each)
+    both round down, and the remainder goes to train's larger one first.
+    `run_splits` below reserves one run per nonzero-ratio split before
+    calling this, specifically to avoid that; this function alone does
+    not guarantee coverage."""
     raw = [n * r for r in ratios.as_tuple()]
     base = [int(x) for x in raw]
     remainder = n - sum(base)
@@ -86,6 +94,41 @@ def _largest_remainder(n: int, ratios: SplitRatios) -> tuple[int, int, int]:
     return base[0], base[1], base[2]
 
 
+def _largest_remainder_with_minimum_coverage(n: int, ratios: SplitRatios) -> tuple[int, int, int]:
+    """Reserves one run for each split with a nonzero ratio before
+    distributing the rest by largest remainder — so a scenario with at
+    least as many runs as there are nonzero-ratio splits is guaranteed to
+    appear in all of them, not just "usually, depending on how the
+    fractional parts happen to round". Falls back to the plain method
+    when there aren't enough runs to reserve one per split; coverage
+    can't be guaranteed then regardless of allocation strategy."""
+    ratio_tuple = ratios.as_tuple()
+    nonzero = [i for i, r in enumerate(ratio_tuple) if r > 0]
+    if n < len(nonzero):
+        return _largest_remainder(n, ratios)
+
+    base = [0, 0, 0]
+    for i in nonzero:
+        base[i] = 1
+    remaining = n - len(nonzero)
+
+    # What each split still needs beyond its reserved 1, floored — then
+    # the leftover (at most 2, same as plain largest-remainder) goes to
+    # the largest fractional parts of that remaining need. Distributing
+    # `remaining` directly via `order[:remaining]` (as an earlier, wrong
+    # version of this function did) only adds 1 per split at most, since
+    # `order` only has 3 entries — silently dropping almost every run once
+    # `remaining` exceeds 2.
+    raw = [n * r for r in ratio_tuple]
+    target = [max(raw[i] - base[i], 0.0) for i in range(3)]
+    extra = [int(x) for x in target]
+    extra_remainder = remaining - sum(extra)
+    order = sorted(range(3), key=lambda i: (target[i] - extra[i], -i), reverse=True)
+    for i in order[:extra_remainder]:
+        extra[i] += 1
+    return base[0] + extra[0], base[1] + extra[1], base[2] + extra[2]
+
+
 def run_splits(
     run_ids_by_scenario: Mapping[str, list[str]],
     seed: int = 0,
@@ -93,16 +136,20 @@ def run_splits(
 ) -> dict[str, str]:
     """Assigns every run_id to train, val or test, one scenario at a time.
 
-    Runs of the same scenario are shuffled deterministically (seeded) and then
-    split by the largest-remainder method, so a scenario with at least three
-    runs is represented in every split, and the overall proportions still
-    track `ratios` as the number of runs grows.
+    Runs of the same scenario are shuffled deterministically (seeded) and
+    then split by `_largest_remainder_with_minimum_coverage`: a scenario
+    with at least as many runs as there are nonzero-ratio splits (normally
+    3, for train/val/test) is guaranteed to be represented in every split,
+    not just "usually" — plain largest-remainder rounding can and does
+    starve a split entirely at small run counts (see that function's
+    docstring), which a comment here used to claim never happens. The
+    overall proportions still track `ratios` as the number of runs grows.
     """
     assignment: dict[str, str] = {}
     for scenario in sorted(run_ids_by_scenario):
         run_ids = sorted(set(run_ids_by_scenario[scenario]))
         order = sorted(run_ids, key=lambda run_id: _bucket_hash(f"{seed}:{scenario}:{run_id}", 0))
-        counts = _largest_remainder(len(order), ratios)
+        counts = _largest_remainder_with_minimum_coverage(len(order), ratios)
         cursor = 0
         for split, count in zip(SPLITS, counts, strict=True):
             for run_id in order[cursor : cursor + count]:
@@ -114,6 +161,33 @@ def run_splits(
 def run_ids_by_scenario(labels: pl.DataFrame) -> dict[str, list[str]]:
     grouped = labels.group_by("scenario").agg(pl.col("run_id"))
     return {row["scenario"]: row["run_id"] for row in grouped.iter_rows(named=True)}
+
+
+def scenario_split_coverage(
+    run_ids_by_scenario: Mapping[str, list[str]],
+    assignment: Mapping[str, str],
+    ratios: SplitRatios = DEFAULT_RATIOS,
+) -> dict[str, list[str]]:
+    """For each scenario with at least as many runs as there are nonzero-
+    ratio splits, reports which of those splits still ended up with zero
+    of that scenario's runs — `run_splits` now reserves one run per split
+    specifically to make this always empty, but this is the explicit,
+    checkable signal for it (written into `split_manifest.json`), not an
+    unverified assumption the reservation logic is bug-free. A scenario
+    with fewer runs than splits is skipped — it cannot possibly cover every
+    split regardless of allocation strategy, which is a known, honest
+    limitation (see `README.md`), not a defect to flag here."""
+    nonzero_splits = [s for s, r in zip(SPLITS, ratios.as_tuple(), strict=True) if r > 0]
+    missing: dict[str, list[str]] = {}
+    for scenario, run_ids in run_ids_by_scenario.items():
+        unique_runs = set(run_ids)
+        if len(unique_runs) < len(nonzero_splits):
+            continue
+        present = {assignment[run_id] for run_id in unique_runs if run_id in assignment}
+        gaps = [split for split in nonzero_splits if split not in present]
+        if gaps:
+            missing[scenario] = gaps
+    return missing
 
 
 def add_split_column(

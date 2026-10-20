@@ -221,6 +221,7 @@ def test_data_split_writes_a_split_column_and_a_manifest(
     manifest = json.loads((tmp_path / "split_manifest.json").read_text())
     assert manifest["seed"] == 0
     assert manifest["reports"]["flows"]["leaking_run_ids"] == []
+    assert manifest["scenario_split_coverage_gaps"] == {}
     assert "split manifest written to" in capsys.readouterr().out
 
 

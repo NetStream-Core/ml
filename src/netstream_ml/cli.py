@@ -57,6 +57,7 @@ from netstream_ml.split import (
     check_run_leakage,
     run_ids_by_scenario,
     run_splits,
+    scenario_split_coverage,
 )
 from netstream_ml.supervised import (
     RandomForestConfig,
@@ -401,7 +402,9 @@ def _run_export(args: argparse.Namespace) -> int:
 def _run_split(args: argparse.Namespace) -> int:
     ratios = SplitRatios(train=args.train, val=args.val, test=args.test)
     labels = pl.read_parquet(args.dataset_dir / "labels.parquet")
-    assignment = run_splits(run_ids_by_scenario(labels), seed=args.seed, ratios=ratios)
+    by_scenario = run_ids_by_scenario(labels)
+    assignment = run_splits(by_scenario, seed=args.seed, ratios=ratios)
+    coverage_gaps = scenario_split_coverage(by_scenario, assignment, ratios)
 
     config = SplitConfig(seed=args.seed, ratios=ratios)
     reports: dict[str, object] = {}
@@ -425,12 +428,19 @@ def _run_split(args: argparse.Namespace) -> int:
                 "ratios": {"train": ratios.train, "val": ratios.val, "test": ratios.test},
                 "run_assignment": assignment,
                 "reports": reports,
+                "scenario_split_coverage_gaps": coverage_gaps,
             },
             indent=2,
         )
         + "\n"
     )
     print(f"split manifest written to {manifest_path}")
+    if coverage_gaps:
+        print(
+            "scenario split coverage gaps (scenario has enough runs to cover every split, "
+            f"but one ended up empty): {coverage_gaps}",
+            file=sys.stderr,
+        )
 
     if not ok:
         print("leakage detected: some run_id appears in more than one split", file=sys.stderr)
