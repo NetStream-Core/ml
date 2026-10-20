@@ -45,6 +45,43 @@ def test_a_scenario_with_at_least_three_runs_appears_in_every_split() -> None:
     assert set(assignment.values()) == set(split.SPLITS)
 
 
+def test_a_scenario_with_exactly_three_runs_appears_in_every_split() -> None:
+    # Regression test: at exactly 3 runs and the default 60/20/20 ratios,
+    # plain largest-remainder rounding gives (2, 1, 0) — both val and
+    # test's fractional parts (0.6) round down, and the one remaining slot
+    # goes to train's larger fractional part first, leaving test with
+    # nothing. Found in practice (M11's drift experiment, both scenarios
+    # had exactly 3 runs before a 4th was added as a workaround) before
+    # this reservation logic existed.
+    runs = {"dns_tunnel": [f"r{i}" for i in range(3)]}
+    assignment = split.run_splits(runs, seed=0)
+    assert set(assignment.values()) == set(split.SPLITS)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_three_runs_appear_in_every_split_across_many_seeds(seed: int) -> None:
+    # The specific case above could coincidentally pass for one seed even
+    # with the bug if the hash-based shuffle happened to break the tie
+    # differently — the real guarantee has to hold regardless of seed.
+    runs = {"dns_tunnel": [f"r{i}" for i in range(3)]}
+    assignment = split.run_splits(runs, seed=seed)
+    assert set(assignment.values()) == set(split.SPLITS)
+
+
+@pytest.mark.parametrize("n", [3, 4, 5, 6, 7, 8, 9, 10, 15, 50, 100, 300])
+def test_run_splits_assigns_every_run_for_a_range_of_scenario_sizes(n: int) -> None:
+    # Regression test for a bug introduced (and caught here) while fixing
+    # the n=3 coverage gap above: a first attempt at reserving one run per
+    # split distributed the rest via `order[:remaining]`, which only adds
+    # at most 1 per split (`order` has 3 entries) — silently dropping
+    # almost every run once a scenario had more than 5 runs. 300 runs
+    # with only 2 landing in train is exactly how that surfaced.
+    runs = {"syn_flood": [f"r{i}" for i in range(n)]}
+    assignment = split.run_splits(runs, seed=0)
+    assert set(assignment) == set(runs["syn_flood"])
+    assert set(assignment.values()) == set(split.SPLITS)
+
+
 def test_run_splits_proportions_track_the_ratios_as_runs_grow() -> None:
     runs = {"syn_flood": [f"r{i}" for i in range(300)]}
     assignment = split.run_splits(runs, seed=0)
@@ -129,3 +166,37 @@ def test_run_ids_by_scenario_groups_labels() -> None:
     grouped = split.run_ids_by_scenario(labels)
     assert set(grouped["syn_flood"]) == {"r1", "r2"}
     assert grouped["benign"] == ["r3"]
+
+
+def test_scenario_split_coverage_is_empty_when_run_splits_covered_everything() -> None:
+    runs = {"dns_tunnel": [f"r{i}" for i in range(4)], "benign": [f"b{i}" for i in range(2)]}
+    assignment = split.run_splits(runs, seed=0)
+
+    gaps = split.scenario_split_coverage(runs, assignment)
+
+    assert gaps == {}
+
+
+def test_scenario_split_coverage_flags_a_split_with_zero_runs() -> None:
+    # A hand-built assignment that skips `test` entirely for a scenario
+    # with enough runs to have covered it — this is what
+    # `_largest_remainder_with_minimum_coverage` is supposed to prevent
+    # `run_splits` from ever producing; this test checks the detector
+    # itself works, independent of whether that guarantee holds.
+    runs = {"dns_tunnel": ["r0", "r1", "r2"]}
+    assignment = {"r0": "train", "r1": "train", "r2": "val"}
+
+    gaps = split.scenario_split_coverage(runs, assignment)
+
+    assert gaps == {"dns_tunnel": ["test"]}
+
+
+def test_scenario_split_coverage_skips_a_scenario_with_too_few_runs_to_cover_everything() -> None:
+    # 2 runs can never cover 3 splits regardless of allocation strategy —
+    # this is the known, documented limitation, not something to flag.
+    runs = {"dns_tunnel": ["r0", "r1"]}
+    assignment = {"r0": "train", "r1": "val"}
+
+    gaps = split.scenario_split_coverage(runs, assignment)
+
+    assert gaps == {}
