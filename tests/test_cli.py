@@ -322,17 +322,45 @@ def test_baseline_threshold_register_model_requires_model_version(tmp_path: Path
     assert exit_code == 1
 
 
+def test_baseline_threshold_register_model_requires_signing_key(tmp_path: Path) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+
+    exit_code = main(
+        [
+            "baseline",
+            "threshold",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--save-model",
+            str(model_path),
+            "--register-model",
+            "threshold",
+            "--model-version",
+            "v1",
+        ]
+    )
+
+    assert exit_code == 1
+
+
 def test_baseline_threshold_register_model_publishes_the_saved_artifact(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_features_dataset_with_split(tmp_path)
     model_path = tmp_path / "model.joblib"
+    signing_key_path = tmp_path / "signing_key.pem"
+    signing_key_path.write_text("not a real key, publish_model is faked below")
     seen: dict[str, object] = {}
 
-    def fake_publish_model(config: object, path: Path, metadata: object) -> dict[str, object]:
+    def fake_publish_model(
+        config: object, path: Path, metadata: object, signing_key_path: Path
+    ) -> dict[str, object]:
         seen["config"] = config
         seen["path"] = path
         seen["metadata"] = metadata
+        seen["signing_key_path"] = signing_key_path
         return {}
 
     monkeypatch.setattr(cli, "publish_model", fake_publish_model)
@@ -350,6 +378,8 @@ def test_baseline_threshold_register_model_publishes_the_saved_artifact(
             "threshold",
             "--model-version",
             "v1",
+            "--signing-key",
+            str(signing_key_path),
             "--backend-url",
             "http://backend:8080",
         ]
@@ -357,6 +387,7 @@ def test_baseline_threshold_register_model_publishes_the_saved_artifact(
 
     assert exit_code == 0
     assert seen["path"] == model_path
+    assert seen["signing_key_path"] == signing_key_path
     assert seen["metadata"].name == "threshold"  # type: ignore[attr-defined]
     assert seen["metadata"].version == "v1"  # type: ignore[attr-defined]
     assert seen["metadata"].algorithm == "threshold"  # type: ignore[attr-defined]
@@ -463,12 +494,18 @@ def test_detect_run_fails_clearly_when_the_registry_is_unreachable() -> None:
 
 
 def test_detect_run_loads_the_named_model_and_starts_the_kafka_loop(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: dict[str, object] = {}
+    verify_key_path = tmp_path / "verify_key.pem"
+    verify_key_path.write_text("not a real key, load_model_from_registry is faked below")
 
     monkeypatch.setattr(cli, "latest_version", lambda config, name: "v2")
-    monkeypatch.setattr(cli, "load_model_from_registry", lambda config, name, version: "fake-model")
+    monkeypatch.setattr(
+        cli,
+        "load_model_from_registry",
+        lambda config, name, version, verify_key_path: "fake-model",
+    )
 
     def fake_run_kafka_detector(config: object) -> None:
         seen["config"] = config
@@ -476,7 +513,16 @@ def test_detect_run_loads_the_named_model_and_starts_the_kafka_loop(
     monkeypatch.setattr(cli, "run_kafka_detector", fake_run_kafka_detector)
 
     exit_code = main(
-        ["detect", "run", "--model-name", "threshold", "--backend-url", "http://backend:8080"]
+        [
+            "detect",
+            "run",
+            "--model-name",
+            "threshold",
+            "--verify-key",
+            str(verify_key_path),
+            "--backend-url",
+            "http://backend:8080",
+        ]
     )
 
     assert exit_code == 0
@@ -522,6 +568,12 @@ def test_detect_run_rejects_both_model_name_and_onnx_model(tmp_path: Path) -> No
 
 def test_detect_run_rejects_neither_model_name_nor_onnx_model() -> None:
     exit_code = main(["detect", "run"])
+
+    assert exit_code == 1
+
+
+def test_detect_run_rejects_model_name_without_verify_key() -> None:
+    exit_code = main(["detect", "run", "--model-name", "threshold"])
 
     assert exit_code == 1
 

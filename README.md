@@ -267,13 +267,21 @@ uv run netstream-ml baseline random-forest data/v1 --window 5 --save-model artif
 Чтобы `detect run` мог взять эту модель без локального файла на диске (например, запущенный в отдельном контейнере/хосте), `--save-model` можно дополнить регистрацией в реестре моделей `backend` (`internal/models`, артефакт лежит в S3-совместимом `objectstore`, сам backend никогда не проксирует байты — отдаёт 302 на presigned URL):
 
 ```bash
+openssl genpkey -algorithm ed25519 -out signing_key.pem
+openssl pkey -in signing_key.pem -pubout -out verify_key.pem
+
 uv run netstream-ml baseline random-forest data/v1 --window 5 \
     --save-model artifacts/model.joblib \
     --register-model random-forest --model-version 2026-10-18 \
+    --signing-key signing_key.pem \
     --backend-url http://127.0.0.1:9999
 ```
 
-`--register-model` требует и `--save-model` (откуда берутся байты), и `--model-version` (у backend нет отдельного алиаса "latest" — версии различаются только явной строкой, обычно датой или git SHA); без одного из них команда возвращает ошибку и ничего не публикует. Проверено на реальном стенде (реальный `backend` на Postgres + SeaweedFS): `baseline threshold --save-model --register-model` реально регистрирует модель и заливает артефакт, а прямой вызов `model_registry.load_model` реально скачивает его через presigned-редирект и разворачивает `joblib.load` — без доступа к S3-ключам на стороне `ml`.
+`--register-model` требует `--save-model` (откуда берутся байты), `--model-version` (у backend нет отдельного алиаса "latest" — версии различаются только явной строкой, обычно датой или git SHA) и `--signing-key` (Ed25519 приватный ключ, PEM) — без любого из трёх команда возвращает ошибку и ничего не публикует.
+
+`--signing-key` — не формальность: `joblib.load()` на произвольных байтах выполняет произвольный код при десериализации, а объектное хранилище и сам backend — не доверенная граница сама по себе (ровно в этом и состоял P0 из внешнего ревью безопасности). `upload_artifact` считает `sha256` байт артефакта и подписывает его `--signing-key` (Ed25519, `netstream_ml.model_registry.sign_artifact`), оба значения уходят в заголовках `X-Artifact-Sha256`/`X-Artifact-Signature` и backend сохраняет их как есть — backend не умеет их проверять, у него нет и не будет приватного ключа, он только хранит то, что заявил публикующий. `detect run --model-name` (и прямой вызов `load_model`) требуют `--verify-key` (Ed25519 публичный ключ) и отказываются грузить артефакт, если `sha256` не совпадает или подпись не проходит — до `joblib.load`, не после.
+
+Проверено на реальном стенде (реальный `backend` на Postgres + SeaweedFS, настоящая пара ключей Ed25519): `baseline random-forest --save-model --register-model --signing-key` реально регистрирует модель, заливает артефакт и возвращает настоящие `sha256`/подпись в `GET /api/v1/models/...`; `load_model` с правильным `--verify-key` реально скачивает артефакт через presigned-редирект, проверяет подпись и разворачивает `joblib.load`; с чужим публичным ключом или с подменёнными байтами (имитация скомпрометированного объектного хранилища) — реальный, не смоделированный отказ до `joblib.load`. Модель без `artifact_sha256`/`artifact_signature` в реестре (загруженная до этой фичи, или без `--signing-key`) тоже не загружается — отсутствие подписи не трактуется как «доверять по умолчанию».
 
 ### Экспорт в ONNX
 
@@ -298,6 +306,7 @@ uv run netstream-ml baseline random-forest data/v1 --window 5 --export-onnx arti
 ```bash
 uv run netstream-ml detect run \
     --model-name random-forest \
+    --verify-key verify_key.pem \
     --window 5 \
     --bootstrap-servers localhost:9092 \
     --events-topic netstream.events.v1 \
@@ -312,7 +321,7 @@ uv run netstream-ml detect run \
 uv run netstream-ml detect run --onnx-model artifacts/model.onnx --window 5 --bootstrap-servers localhost:9092
 ```
 
-`--onnx-model` разворачивает файл через `onnxruntime.InferenceSession` один раз при старте (`OnnxBaseline` в `netstream_ml.onnx_export` — реализует тот же протокол `Baseline`, что и `joblib`-модели, так что `OnlineDetector` не видит разницы) и дальше работает как обычно, без обращения к `backend` вообще. `--model-name` обязателен для пути через реестр; `--model-version` по умолчанию берёт самую новую зарегистрированную версию этого имени (backend сортирует список по `(name, created_at DESC)`, так что первое совпадение по имени уже самое новое — отдельного алиаса для этого нет). `--backend-url` можно не указывать явно — он читается из `BACKEND_URL`. Остальные флаги можно задать переменными окружения вместо флагов: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_EVENTS_TOPIC`, `KAFKA_DETECTIONS_TOPIC`, `KAFKA_CONSUMER_GROUP` — тот же принцип, что и у `CLICKHOUSE_URL` для offline-команд.
+`--onnx-model` разворачивает файл через `onnxruntime.InferenceSession` один раз при старте (`OnnxBaseline` в `netstream_ml.onnx_export` — реализует тот же протокол `Baseline`, что и `joblib`-модели, так что `OnlineDetector` не видит разницы) и дальше работает как обычно, без обращения к `backend` вообще. `--model-name` обязателен для пути через реестр, вместе с `--verify-key` (Ed25519 публичный ключ — см. «Сохранение и регистрация модели (M14)» выше; без него команда отказывается стартовать, а не грузит модель без проверки); `--model-version` по умолчанию берёт самую новую зарегистрированную версию этого имени (backend сортирует список по `(name, created_at DESC)`, так что первое совпадение по имени уже самое новое — отдельного алиаса для этого нет). `--backend-url` можно не указывать явно — он читается из `BACKEND_URL`. Остальные флаги можно задать переменными окружения вместо флагов: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_EVENTS_TOPIC`, `KAFKA_DETECTIONS_TOPIC`, `KAFKA_CONSUMER_GROUP` — тот же принцип, что и у `CLICKHOUSE_URL` для offline-команд.
 
 Консюмер читает `--events-topic`, декодирует OTLP-батч, кормит окна в накопитель своего `host_id` и для каждого закрывшегося окна считает `score`/`is_attack` обученной моделью, публикует результат в `--detections-topic` и пишет его в лог, если это атака. Окно, не получившее более позднюю запись того же источника (источник ушёл в тишину), иначе осталось бы открытым навсегда — поэтому раз в `--idle-flush-seconds` детектор принудительно закрывает (`flush`) все ещё открытые окна по всем сенсорам, а также один раз при остановке. При завершении печатает p50/p95 задержки по всем сделанным детекциям.
 
