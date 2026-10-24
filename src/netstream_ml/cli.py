@@ -6,7 +6,6 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 
 from netstream_ml import __version__
@@ -16,6 +15,12 @@ from netstream_ml.anomaly import (
     evaluate_isolation_forest_by_scenario,
     fit_isolation_forest,
 )
+from netstream_ml.baseline_cli import (
+    finish_baseline_run,
+    load_split_dataset,
+    metrics_by_scenario,
+    metrics_by_split,
+)
 from netstream_ml.baselines import (
     ClassificationMetrics,
     evaluate_baseline,
@@ -24,7 +29,7 @@ from netstream_ml.baselines import (
 )
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.dataset import export_dataset
-from netstream_ml.detector import Baseline, KafkaDetectorConfig, run_kafka_detector, save_model
+from netstream_ml.detector import Baseline, KafkaDetectorConfig, run_kafka_detector
 from netstream_ml.evaluation import mcnemar_test, precision_recall_curve, seed_sensitivity
 from netstream_ml.external import (
     RECONSTRUCTABLE_FEATURES,
@@ -41,15 +46,9 @@ from netstream_ml.gradient_boosting import (
     tune_gradient_boosting,
 )
 from netstream_ml.intensity import attach_rate, evaluate_by_rate
-from netstream_ml.model_registry import (
-    ModelMetadata,
-    RegistryConfig,
-    RegistryError,
-    latest_version,
-    publish_model,
-)
+from netstream_ml.model_registry import RegistryConfig, RegistryError, latest_version
 from netstream_ml.model_registry import load_model as load_model_from_registry
-from netstream_ml.onnx_export import load_onnx_baseline, run_onnx, save_onnx_model, to_onnx
+from netstream_ml.onnx_export import load_onnx_baseline
 from netstream_ml.split import (
     SplitConfig,
     SplitRatios,
@@ -477,136 +476,42 @@ def _run_features_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def _maybe_register_model(
-    args: argparse.Namespace, algorithm: str, metrics_by_split: dict[str, object]
-) -> int:
-    if args.register_model is None:
-        return 0
-    if args.save_model is None:
-        print("--register-model requires --save-model", file=sys.stderr)
-        return 1
-    if args.model_version is None:
-        print("--register-model requires --model-version", file=sys.stderr)
-        return 1
-    if args.signing_key is None:
-        print("--register-model requires --signing-key", file=sys.stderr)
-        return 1
-
-    registry = RegistryConfig(backend_url=args.backend_url)
-    metadata = ModelMetadata(
-        name=args.register_model,
-        version=args.model_version,
-        algorithm=algorithm,
-        features_version=f"w{args.window}",
-        metrics=metrics_by_split,
-    )
-    try:
-        publish_model(registry, args.save_model, metadata, args.signing_key)
-    except RegistryError as error:
-        print(str(error), file=sys.stderr)
-        return 1
-    print(f"model registered: {args.register_model}@{args.model_version} ({args.backend_url})")
-    return 0
-
-
-def _maybe_export_onnx(args: argparse.Namespace, model: Baseline, test: pl.DataFrame) -> int:
-    if args.export_onnx is None:
-        return 0
-
-    try:
-        onnx_model, feature_order, kind = to_onnx(model)
-    except TypeError as error:
-        print(str(error), file=sys.stderr)
-        return 1
-
-    if test.height > 0:
-        onnx_predict, onnx_score = run_onnx(onnx_model, test, feature_order, kind)
-        original_predict = model.predict(test).to_numpy()
-        original_score = model.decision_score(test).to_numpy()
-        if not np.array_equal(onnx_predict, original_predict) or not np.allclose(
-            onnx_score, original_score, atol=1e-4
-        ):
-            print(
-                "ONNX export does not match the original model's predict/decision_score "
-                "on the test split; refusing to write a silently wrong file",
-                file=sys.stderr,
-            )
-            return 1
-
-    save_onnx_model(onnx_model, args.export_onnx)
-    print(f"model exported to ONNX at {args.export_onnx}")
-    return 0
-
-
 def _run_baseline_threshold(args: argparse.Namespace) -> int:
-    path = args.dataset_dir / f"features_w{args.window}.parquet"
-    frame = pl.read_parquet(path)
-    if "split" not in frame.columns:
-        print(
-            f"{path} has no 'split' column; run `data split` before `features build`",
-            file=sys.stderr,
-        )
+    frame = load_split_dataset(args.dataset_dir, args.window)
+    if frame is None:
         return 1
 
     train = frame.filter(pl.col("split") == "train")
     model = fit_threshold_baseline(train, target_fpr=args.target_fpr)
 
-    metrics_by_split: dict[str, object] = {}
-    for split_name in ("train", "val", "test"):
-        subset = frame.filter(pl.col("split") == split_name)
-        if subset.height == 0:
-            continue
-        metrics = evaluate_baseline(model, subset)
-        metrics_by_split[split_name] = metrics.to_dict()
-        print(
-            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
-            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
-        )
-
+    by_split = metrics_by_split(model, frame, evaluate_baseline)
     test = frame.filter(pl.col("split") == "test")
-    by_scenario = (
-        {
-            scenario: metrics.to_dict()
-            for scenario, metrics in evaluate_baseline_by_scenario(model, test).items()
-        }
-        if test.height > 0
-        else {}
-    )
+    by_scenario = metrics_by_scenario(model, test, evaluate_baseline_by_scenario)
 
     result = {
         "window_seconds": args.window,
         "target_fpr": args.target_fpr,
         "rules": model.to_dict(),
-        "metrics_by_split": metrics_by_split,
+        "metrics_by_split": by_split,
         "test_metrics_by_scenario": by_scenario,
     }
-    out_path = args.dataset_dir / f"baseline_threshold_w{args.window}.json"
-    out_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"baseline report written to {out_path}")
-
-    with track_run(
-        "baseline-threshold", {"window_seconds": args.window, "target_fpr": args.target_fpr}
-    ) as run:
-        run.log_metrics(metrics_by_split)
-        run.log_artifact(out_path)
-
-    if args.save_model is not None:
-        save_model(model, args.save_model)
-        print(f"model saved to {args.save_model}")
-    register_exit_code = _maybe_register_model(args, "threshold", metrics_by_split)
-    if register_exit_code != 0:
-        return register_exit_code
-    return _maybe_export_onnx(args, model, test)
+    return finish_baseline_run(
+        args,
+        model=model,
+        test=test,
+        model_kind="threshold",
+        report_label="baseline report",
+        out_path=args.dataset_dir / f"baseline_threshold_w{args.window}.json",
+        result=result,
+        by_split=by_split,
+        track_name="baseline-threshold",
+        track_params={"window_seconds": args.window, "target_fpr": args.target_fpr},
+    )
 
 
 def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
-    path = args.dataset_dir / f"features_w{args.window}.parquet"
-    frame = pl.read_parquet(path)
-    if "split" not in frame.columns:
-        print(
-            f"{path} has no 'split' column; run `data split` before `features build`",
-            file=sys.stderr,
-        )
+    frame = load_split_dataset(args.dataset_dir, args.window)
+    if frame is None:
         return 1
 
     train = frame.filter(pl.col("split") == "train")
@@ -617,68 +522,39 @@ def _run_baseline_isolation_forest(args: argparse.Namespace) -> int:
     )
     model = fit_isolation_forest(train, config)
 
-    metrics_by_split: dict[str, object] = {}
-    for split_name in ("train", "val", "test"):
-        subset = frame.filter(pl.col("split") == split_name)
-        if subset.height == 0:
-            continue
-        metrics = evaluate_isolation_forest(model, subset)
-        metrics_by_split[split_name] = metrics.to_dict()
-        print(
-            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
-            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
-        )
-
+    by_split = metrics_by_split(model, frame, evaluate_isolation_forest)
     test = frame.filter(pl.col("split") == "test")
-    by_scenario = (
-        {
-            scenario: metrics.to_dict()
-            for scenario, metrics in evaluate_isolation_forest_by_scenario(model, test).items()
-        }
-        if test.height > 0
-        else {}
-    )
+    by_scenario = metrics_by_scenario(model, test, evaluate_isolation_forest_by_scenario)
 
     result = {
         "window_seconds": args.window,
         "contamination": args.contamination,
         "model": model.to_dict(),
-        "metrics_by_split": metrics_by_split,
+        "metrics_by_split": by_split,
         "test_metrics_by_scenario": by_scenario,
     }
-    out_path = args.dataset_dir / f"isolation_forest_w{args.window}.json"
-    out_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"isolation forest report written to {out_path}")
-
-    with track_run(
-        "baseline-isolation-forest",
-        {
+    return finish_baseline_run(
+        args,
+        model=model,
+        test=test,
+        model_kind="isolation-forest",
+        report_label="isolation forest report",
+        out_path=args.dataset_dir / f"isolation_forest_w{args.window}.json",
+        result=result,
+        by_split=by_split,
+        track_name="baseline-isolation-forest",
+        track_params={
             "window_seconds": args.window,
             "contamination": args.contamination,
             "n_estimators": args.n_estimators,
             "random_state": args.random_state,
         },
-    ) as run:
-        run.log_metrics(metrics_by_split)
-        run.log_artifact(out_path)
-
-    if args.save_model is not None:
-        save_model(model, args.save_model)
-        print(f"model saved to {args.save_model}")
-    register_exit_code = _maybe_register_model(args, "isolation-forest", metrics_by_split)
-    if register_exit_code != 0:
-        return register_exit_code
-    return _maybe_export_onnx(args, model, test)
+    )
 
 
 def _run_baseline_random_forest(args: argparse.Namespace) -> int:
-    path = args.dataset_dir / f"features_w{args.window}.parquet"
-    frame = pl.read_parquet(path)
-    if "split" not in frame.columns:
-        print(
-            f"{path} has no 'split' column; run `data split` before `features build`",
-            file=sys.stderr,
-        )
+    frame = load_split_dataset(args.dataset_dir, args.window)
+    if frame is None:
         return 1
 
     train = frame.filter(pl.col("split") == "train")
@@ -691,63 +567,38 @@ def _run_baseline_random_forest(args: argparse.Namespace) -> int:
         f"{tuning.candidates_tried} candidates)"
     )
 
-    metrics_by_split: dict[str, object] = {}
-    for split_name in ("train", "val", "test"):
-        subset = frame.filter(pl.col("split") == split_name)
-        if subset.height == 0:
-            continue
-        metrics = evaluate_random_forest(model, subset)
-        metrics_by_split[split_name] = metrics.to_dict()
-        print(
-            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
-            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
-        )
-
+    by_split = metrics_by_split(model, frame, evaluate_random_forest)
     test = frame.filter(pl.col("split") == "test")
-    by_scenario = (
-        {
-            scenario: metrics.to_dict()
-            for scenario, metrics in evaluate_random_forest_by_scenario(model, test).items()
-        }
-        if test.height > 0
-        else {}
-    )
+    by_scenario = metrics_by_scenario(model, test, evaluate_random_forest_by_scenario)
 
     result = {
         "window_seconds": args.window,
         "tuning": tuning.to_dict(),
         "model": model.to_dict(),
-        "metrics_by_split": metrics_by_split,
+        "metrics_by_split": by_split,
         "test_metrics_by_scenario": by_scenario,
     }
-    out_path = args.dataset_dir / f"random_forest_w{args.window}.json"
-    out_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"random forest report written to {out_path}")
-
-    with track_run(
-        "baseline-random-forest",
-        {"window_seconds": args.window, "random_state": args.random_state, **tuning.to_dict()},
-    ) as run:
-        run.log_metrics(metrics_by_split)
-        run.log_artifact(out_path)
-
-    if args.save_model is not None:
-        save_model(model, args.save_model)
-        print(f"model saved to {args.save_model}")
-    register_exit_code = _maybe_register_model(args, "random-forest", metrics_by_split)
-    if register_exit_code != 0:
-        return register_exit_code
-    return _maybe_export_onnx(args, model, test)
+    return finish_baseline_run(
+        args,
+        model=model,
+        test=test,
+        model_kind="random-forest",
+        report_label="random forest report",
+        out_path=args.dataset_dir / f"random_forest_w{args.window}.json",
+        result=result,
+        by_split=by_split,
+        track_name="baseline-random-forest",
+        track_params={
+            "window_seconds": args.window,
+            "random_state": args.random_state,
+            **tuning.to_dict(),
+        },
+    )
 
 
 def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
-    path = args.dataset_dir / f"features_w{args.window}.parquet"
-    frame = pl.read_parquet(path)
-    if "split" not in frame.columns:
-        print(
-            f"{path} has no 'split' column; run `data split` before `features build`",
-            file=sys.stderr,
-        )
+    frame = load_split_dataset(args.dataset_dir, args.window)
+    if frame is None:
         return 1
 
     train = frame.filter(pl.col("split") == "train")
@@ -760,53 +611,33 @@ def _run_baseline_gradient_boosting(args: argparse.Namespace) -> int:
         f"{tuning.candidates_tried} candidates)"
     )
 
-    metrics_by_split: dict[str, object] = {}
-    for split_name in ("train", "val", "test"):
-        subset = frame.filter(pl.col("split") == split_name)
-        if subset.height == 0:
-            continue
-        metrics = evaluate_gradient_boosting(model, subset)
-        metrics_by_split[split_name] = metrics.to_dict()
-        print(
-            f"{split_name}: precision={metrics.precision:.3f} recall={metrics.recall:.3f} "
-            f"f1={metrics.f1:.3f} fpr={metrics.fpr:.4f} (n={subset.height})"
-        )
-
+    by_split = metrics_by_split(model, frame, evaluate_gradient_boosting)
     test = frame.filter(pl.col("split") == "test")
-    by_scenario = (
-        {
-            scenario: metrics.to_dict()
-            for scenario, metrics in evaluate_gradient_boosting_by_scenario(model, test).items()
-        }
-        if test.height > 0
-        else {}
-    )
+    by_scenario = metrics_by_scenario(model, test, evaluate_gradient_boosting_by_scenario)
 
     result = {
         "window_seconds": args.window,
         "tuning": tuning.to_dict(),
         "model": model.to_dict(),
-        "metrics_by_split": metrics_by_split,
+        "metrics_by_split": by_split,
         "test_metrics_by_scenario": by_scenario,
     }
-    out_path = args.dataset_dir / f"gradient_boosting_w{args.window}.json"
-    out_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"gradient boosting report written to {out_path}")
-
-    with track_run(
-        "baseline-gradient-boosting",
-        {"window_seconds": args.window, "random_state": args.random_state, **tuning.to_dict()},
-    ) as run:
-        run.log_metrics(metrics_by_split)
-        run.log_artifact(out_path)
-
-    if args.save_model is not None:
-        save_model(model, args.save_model)
-        print(f"model saved to {args.save_model}")
-    register_exit_code = _maybe_register_model(args, "gradient-boosting", metrics_by_split)
-    if register_exit_code != 0:
-        return register_exit_code
-    return _maybe_export_onnx(args, model, test)
+    return finish_baseline_run(
+        args,
+        model=model,
+        test=test,
+        model_kind="gradient-boosting",
+        report_label="gradient boosting report",
+        out_path=args.dataset_dir / f"gradient_boosting_w{args.window}.json",
+        result=result,
+        by_split=by_split,
+        track_name="baseline-gradient-boosting",
+        track_params={
+            "window_seconds": args.window,
+            "random_state": args.random_state,
+            **tuning.to_dict(),
+        },
+    )
 
 
 def _run_evaluate_compare(args: argparse.Namespace) -> int:
