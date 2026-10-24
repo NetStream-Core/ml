@@ -6,7 +6,7 @@ import onnx
 import polars as pl
 import pytest
 
-from netstream_ml import __version__, cli
+from netstream_ml import __version__, baseline_cli, cli
 from netstream_ml.cli import main
 from netstream_ml.clickhouse import ClickHouseConfig
 from netstream_ml.detector import load_model
@@ -380,7 +380,7 @@ def test_baseline_threshold_register_model_publishes_the_saved_artifact(
         seen["signing_key_path"] = signing_key_path
         return {}
 
-    monkeypatch.setattr(cli, "publish_model", fake_publish_model)
+    monkeypatch.setattr(baseline_cli, "publish_model", fake_publish_model)
 
     exit_code = main(
         [
