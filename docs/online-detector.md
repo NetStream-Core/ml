@@ -59,7 +59,9 @@ uv run netstream-ml baseline random-forest data/v1 --window 5 --export-onnx arti
 
 Экспортированная модель самодостаточна: `to_onnx()` записывает `feature_order` и тип baseline (`kind`) прямо в `metadata_props` файла — `.onnx` с диска можно загрузить обратно и сразу использовать, без отдельного sidecar-файла с метаданными (см. «`detect run`» ниже).
 
-**Что здесь не сделано.** `--export-onnx` — отдельный путь от `--save-model`/`--register-model`: экспортированный `.onnx`-файл никуда не публикуется (ни в реестр моделей `backend`, ни в объектное хранилище), это просто локальный файл. `detect run --onnx-model` (ниже) умеет его читать, но по-прежнему только с диска — связать ONNX с реестром моделей (регистрация/скачивание `.onnx`-артефактов тем же путём, что и `.joblib`) пока не сделано.
+Если на той же команде задан и `--register-model` (вместе с `--model-version`/`--signing-key`, как для `--save-model` выше), `.onnx`-файл после успешной локальной проверки заливается в реестр `backend` тем же путём, что и `.joblib`-артефакт — отдельная запись каталога (`onnx_artifact_uri`/`onnx_artifact_sha256`/`onnx_artifact_signature`), на той же записи модели, независимая от `artifact_uri`: можно зарегистрировать только `.joblib`, только ONNX, оба или ни одного. Загрузка обратно — `detect run --onnx-model-name` (ниже), тем же `--verify-key`, что и у `--model-name`.
+
+Проверено на реальном стенде (тот же `backend` на Postgres + SeaweedFS, та же пара ключей Ed25519, что и выше): `baseline gradient-boosting --save-model --register-model --export-onnx --signing-key` реально регистрирует модель, заливает и `.joblib`, и `.onnx`-артефакт, оба с настоящими `sha256`/подписью в `GET /api/v1/models/...`; `detect run --onnx-model-name --verify-key` реально скачивает `.onnx` через presigned-редирект, проверяет подпись, разворачивает `onnxruntime.InferenceSession` и доходит до подключения к Kafka — то же сквозное поведение, что у `--model-name`/`.joblib`, просто для ONNX-пути.
 
 ## `detect run`
 
@@ -75,11 +77,14 @@ uv run netstream-ml detect run \
     --idle-flush-seconds 30
 ```
 
-Ровно один из `--model-name` (реестр `backend`) или `--onnx-model PATH` (локальный файл от `--export-onnx` выше) обязателен — ни тот, ни другой по умолчанию, оба сразу или ни одного — явная ошибка:
+Ровно один из `--model-name` (реестр `backend`, `.joblib`), `--onnx-model PATH` (локальный файл от `--export-onnx` выше) или `--onnx-model-name` (реестр `backend`, ONNX-артефакт того же `--export-onnx --register-model`) обязателен — ни один по умолчанию, два или три сразу — явная ошибка:
 
 ```bash
 uv run netstream-ml detect run --onnx-model artifacts/model.onnx --window 5 --bootstrap-servers localhost:9092
+uv run netstream-ml detect run --onnx-model-name gradient-boosting --verify-key verify_key.pem --window 5 --bootstrap-servers localhost:9092
 ```
+
+`--onnx-model-name` принимает те же `--model-version`/`--backend-url`, что и `--model-name` (версия по умолчанию — самая новая зарегистрированная), и обязательно требует `--verify-key` по той же причине: без подписи `.onnx`-артефакт не отличить от подменённого.
 
 `--onnx-model` разворачивает файл через `onnxruntime.InferenceSession` один раз при старте (`OnnxBaseline` в `netstream_ml.onnx_export` — реализует тот же протокол `Baseline`, что и `joblib`-модели, так что `OnlineDetector` не видит разницы) и дальше работает как обычно, без обращения к `backend` вообще. `--model-name` обязателен для пути через реестр, вместе с `--verify-key` (Ed25519 публичный ключ — см. «Сохранение и регистрация модели (M14)» выше; без него команда отказывается стартовать, а не грузит модель без проверки); `--model-version` по умолчанию берёт самую новую зарегистрированную версию этого имени (backend сортирует список по `(name, created_at DESC)`, так что первое совпадение по имени уже самое новое — отдельного алиаса для этого нет). `--backend-url` можно не указывать явно — он читается из `BACKEND_URL`. Остальные флаги можно задать переменными окружения вместо флагов: `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_EVENTS_TOPIC`, `KAFKA_DETECTIONS_TOPIC`, `KAFKA_CONSUMER_GROUP` — тот же принцип, что и у `CLICKHOUSE_URL` для offline-команд.
 
