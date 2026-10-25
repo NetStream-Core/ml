@@ -426,6 +426,76 @@ def test_baseline_threshold_export_onnx_writes_a_verified_model(
     onnx.checker.check_model(onnx.load(onnx_path))
 
 
+def test_baseline_threshold_register_model_also_uploads_the_onnx_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    model_path = tmp_path / "model.joblib"
+    onnx_path = tmp_path / "model.onnx"
+    signing_key_path = tmp_path / "signing_key.pem"
+    signing_key_path.write_text("not a real key, publish_model/upload_onnx_artifact are faked")
+
+    monkeypatch.setattr(baseline_cli, "publish_model", lambda *args, **kwargs: {})
+    seen: dict[str, object] = {}
+
+    def fake_upload_onnx_artifact(
+        config: object, name: str, version: str, path: Path, signing_key_path: Path
+    ) -> dict[str, object]:
+        seen["name"] = name
+        seen["version"] = version
+        seen["path"] = path
+        return {}
+
+    monkeypatch.setattr(baseline_cli, "upload_onnx_artifact", fake_upload_onnx_artifact)
+
+    exit_code = main(
+        [
+            "baseline",
+            "threshold",
+            str(tmp_path),
+            "--window",
+            "5",
+            "--save-model",
+            str(model_path),
+            "--register-model",
+            "threshold",
+            "--model-version",
+            "v1",
+            "--signing-key",
+            str(signing_key_path),
+            "--export-onnx",
+            str(onnx_path),
+            "--backend-url",
+            "http://backend:8080",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen["name"] == "threshold"
+    assert seen["version"] == "v1"
+    assert seen["path"] == onnx_path
+    assert "onnx artifact registered: threshold@v1 (http://backend:8080)" in capsys.readouterr().out
+
+
+def test_baseline_threshold_export_onnx_without_register_model_does_not_touch_the_registry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_features_dataset_with_split(tmp_path)
+    onnx_path = tmp_path / "model.onnx"
+
+    def fail_if_called(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("upload_onnx_artifact should not be called without --register-model")
+
+    monkeypatch.setattr(baseline_cli, "upload_onnx_artifact", fail_if_called)
+
+    exit_code = main(
+        ["baseline", "threshold", str(tmp_path), "--window", "5", "--export-onnx", str(onnx_path)]
+    )
+
+    assert exit_code == 0
+    assert "onnx artifact registered" not in capsys.readouterr().out
+
+
 def test_baseline_random_forest_export_onnx_writes_a_verified_model(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -566,6 +636,68 @@ def test_detect_run_loads_a_local_onnx_model_instead_of_the_registry(
     assert exit_code == 0
     assert seen["config"].model == "fake-onnx-model"  # type: ignore[attr-defined]
     assert f"model loaded: {onnx_path} (ONNX)" in capsys.readouterr().out
+
+
+def test_detect_run_loads_the_named_onnx_model_from_registry_and_starts_the_kafka_loop(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+    verify_key_path = tmp_path / "verify_key.pem"
+    verify_key_path.write_text("not a real key, load_onnx_model_from_registry is faked below")
+
+    monkeypatch.setattr(cli, "latest_version", lambda config, name: "v3")
+    monkeypatch.setattr(
+        cli,
+        "load_onnx_model_from_registry",
+        lambda config, name, version, verify_key_path: b"fake-onnx-bytes",
+    )
+    monkeypatch.setattr(cli, "load_onnx_baseline", lambda path: "fake-onnx-model")
+
+    def fake_run_kafka_detector(config: object) -> None:
+        seen["config"] = config
+
+    monkeypatch.setattr(cli, "run_kafka_detector", fake_run_kafka_detector)
+
+    exit_code = main(
+        [
+            "detect",
+            "run",
+            "--onnx-model-name",
+            "gradient-boosting",
+            "--verify-key",
+            str(verify_key_path),
+            "--backend-url",
+            "http://backend:8080",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen["config"].model == "fake-onnx-model"  # type: ignore[attr-defined]
+    out = capsys.readouterr().out
+    assert "model loaded: gradient-boosting@v3 from http://backend:8080 (ONNX)" in out
+
+
+def test_detect_run_rejects_onnx_model_name_without_verify_key() -> None:
+    exit_code = main(["detect", "run", "--onnx-model-name", "gradient-boosting"])
+
+    assert exit_code == 1
+
+
+def test_detect_run_rejects_model_name_and_onnx_model_name_together(tmp_path: Path) -> None:
+    exit_code = main(
+        [
+            "detect",
+            "run",
+            "--model-name",
+            "threshold",
+            "--onnx-model-name",
+            "threshold",
+            "--verify-key",
+            str(tmp_path / "verify_key.pem"),
+        ]
+    )
+
+    assert exit_code == 1
 
 
 def test_detect_run_rejects_both_model_name_and_onnx_model(tmp_path: Path) -> None:

@@ -187,6 +187,116 @@ def test_download_artifact_follows_the_redirect_transparently(
     assert model_registry.download_artifact(config, "threshold", "v1") == b"artifact-bytes"
 
 
+def test_upload_onnx_artifact_puts_the_file_bytes_with_a_real_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"fake-onnx-bytes")
+    signing_key_path, verify_key_path = _write_ed25519_keypair(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
+        seen["url"] = request.full_url
+        seen["method"] = request.get_method()
+        seen["data"] = request.data
+        seen["sha256"] = request.get_header("X-artifact-sha256")
+        seen["signature"] = request.get_header("X-artifact-signature")
+        return FakeResponse(b'{"status": "ok"}')
+
+    monkeypatch.setattr("netstream_ml.model_registry.urllib_request.urlopen", fake_urlopen)
+    config = model_registry.RegistryConfig(backend_url="http://backend:8080")
+
+    model_registry.upload_onnx_artifact(
+        config, "gradient-boosting", "v1", onnx_path, signing_key_path
+    )
+
+    assert seen["url"] == "http://backend:8080/api/v1/models/gradient-boosting/v1/onnx"
+    assert seen["method"] == "PUT"
+    assert seen["data"] == b"fake-onnx-bytes"
+    assert isinstance(seen["sha256"], str) and len(seen["sha256"]) == 64
+    assert isinstance(seen["signature"], str)
+    model_registry.verify_artifact(
+        b"fake-onnx-bytes", seen["sha256"], seen["signature"], verify_key_path
+    )
+
+
+def test_download_onnx_artifact_follows_the_redirect_transparently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.urllib_request.urlopen",
+        lambda request, timeout: FakeResponse(b"onnx-artifact-bytes"),
+    )
+    config = model_registry.RegistryConfig(backend_url="http://backend:8080")
+
+    assert (
+        model_registry.download_onnx_artifact(config, "gradient-boosting", "v1")
+        == b"onnx-artifact-bytes"
+    )
+
+
+def test_load_onnx_model_resolves_latest_version_verifies_and_returns_the_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signing_key_path, verify_key_path = _write_ed25519_keypair(tmp_path)
+    artifact = b"fake-onnx-bytes"
+    sha256_hex, signature_b64 = model_registry.sign_artifact(artifact, signing_key_path)
+
+    monkeypatch.setattr("netstream_ml.model_registry.latest_version", lambda config, name: "v2")
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.get_model",
+        lambda config, name, version: {
+            "onnx_artifact_sha256": sha256_hex,
+            "onnx_artifact_signature": signature_b64,
+        },
+    )
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.download_onnx_artifact",
+        lambda config, name, version: artifact,
+    )
+    config = model_registry.RegistryConfig()
+
+    loaded = model_registry.load_onnx_model(config, "gradient-boosting", None, verify_key_path)
+    assert loaded == artifact
+
+
+def test_load_onnx_model_refuses_an_artifact_with_no_recorded_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, verify_key_path = _write_ed25519_keypair(tmp_path)
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.get_model",
+        lambda config, name, version: {"onnx_artifact_sha256": "", "onnx_artifact_signature": ""},
+    )
+    config = model_registry.RegistryConfig()
+
+    with pytest.raises(model_registry.RegistryError, match="no recorded"):
+        model_registry.load_onnx_model(config, "gradient-boosting", "v1", verify_key_path)
+
+
+def test_load_onnx_model_refuses_a_tampered_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    signing_key_path, verify_key_path = _write_ed25519_keypair(tmp_path)
+    sha256_hex, signature_b64 = model_registry.sign_artifact(b"original bytes", signing_key_path)
+
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.get_model",
+        lambda config, name, version: {
+            "onnx_artifact_sha256": sha256_hex,
+            "onnx_artifact_signature": signature_b64,
+        },
+    )
+    monkeypatch.setattr(
+        "netstream_ml.model_registry.download_onnx_artifact",
+        lambda config, name, version: b"tampered bytes",
+    )
+    config = model_registry.RegistryConfig()
+
+    with pytest.raises(model_registry.RegistryError, match="sha256"):
+        model_registry.load_onnx_model(config, "gradient-boosting", "v1", verify_key_path)
+
+
 def test_publish_model_registers_then_uploads_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

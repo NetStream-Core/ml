@@ -180,6 +180,48 @@ def download_artifact(config: RegistryConfig, name: str, version: str) -> bytes:
     return _request(config, f"/api/v1/models/{name}/{version}/artifact")
 
 
+def upload_onnx_artifact(
+    config: RegistryConfig, name: str, version: str, path: Path, signing_key_path: Path
+) -> dict[str, object]:
+    data = path.read_bytes()
+    sha256_hex, signature_b64 = sign_artifact(data, signing_key_path)
+    body = _request(
+        config,
+        f"/api/v1/models/{name}/{version}/onnx",
+        method="PUT",
+        data=data,
+        headers={
+            "Content-Type": "application/octet-stream",
+            "X-Artifact-Sha256": sha256_hex,
+            "X-Artifact-Signature": signature_b64,
+        },
+    )
+    return cast(dict[str, object], json.loads(body))
+
+
+def download_onnx_artifact(config: RegistryConfig, name: str, version: str) -> bytes:
+    return _request(config, f"/api/v1/models/{name}/{version}/onnx")
+
+
+def load_onnx_model(
+    config: RegistryConfig, name: str, version: str | None, verify_key_path: Path
+) -> bytes:
+    resolved_version = version or latest_version(config, name)
+    model_record = get_model(config, name, resolved_version)
+    sha256_hex = cast(str, model_record.get("onnx_artifact_sha256") or "")
+    signature_b64 = cast(str, model_record.get("onnx_artifact_signature") or "")
+    if not sha256_hex or not signature_b64:
+        raise RegistryError(
+            f"{name}@{resolved_version} has no recorded onnx_artifact_sha256/"
+            "onnx_artifact_signature — it has no ONNX export registered, or was uploaded "
+            "without --signing-key; refusing to load an artifact with no integrity record"
+        )
+
+    artifact = download_onnx_artifact(config, name, resolved_version)
+    verify_artifact(artifact, sha256_hex, signature_b64, verify_key_path)
+    return artifact
+
+
 def load_model(
     config: RegistryConfig, name: str, version: str | None, verify_key_path: Path
 ) -> Baseline:

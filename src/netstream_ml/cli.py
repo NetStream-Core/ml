@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from netstream_ml.gradient_boosting import (
 from netstream_ml.intensity import attach_rate, evaluate_by_rate
 from netstream_ml.model_registry import RegistryConfig, RegistryError, latest_version
 from netstream_ml.model_registry import load_model as load_model_from_registry
+from netstream_ml.model_registry import load_onnx_model as load_onnx_model_from_registry
 from netstream_ml.onnx_export import load_onnx_baseline
 from netstream_ml.split import (
     SplitConfig,
@@ -268,19 +270,19 @@ def _add_detect_subparsers(
         "--model-name",
         default=None,
         help="a model registered via `baseline ... --save-model ... --register-model NAME` "
-        "(exactly one of --model-name or --onnx-model is required)",
+        "(exactly one of --model-name, --onnx-model or --onnx-model-name is required)",
     )
     run.add_argument(
         "--model-version",
         default=None,
-        help="defaults to the newest version registered for --model-name",
+        help="defaults to the newest version registered for --model-name/--onnx-model-name",
     )
     run.add_argument(
         "--verify-key",
         type=Path,
         default=None,
-        help="Ed25519 public key (PEM) to verify --model-name's artifact signature against "
-        "before loading it (required together with --model-name)",
+        help="Ed25519 public key (PEM) to verify --model-name's/--onnx-model-name's artifact "
+        "signature against before loading it (required together with either)",
     )
     run.add_argument(
         "--backend-url", default=os.environ.get("BACKEND_URL", "http://127.0.0.1:9999")
@@ -290,7 +292,15 @@ def _add_detect_subparsers(
         type=Path,
         default=None,
         help="a local file written by `baseline ... --export-onnx`, as an alternative to "
-        "--model-name's registry lookup (exactly one of the two is required)",
+        "--model-name's/--onnx-model-name's registry lookup (exactly one of the three is "
+        "required)",
+    )
+    run.add_argument(
+        "--onnx-model-name",
+        default=None,
+        help="the ONNX artifact of a model registered via `baseline ... --export-onnx ... "
+        "--register-model NAME` (exactly one of --model-name, --onnx-model or "
+        "--onnx-model-name is required)",
     )
     run.add_argument("--window", type=int, default=5, help="window size in seconds")
     run.add_argument(
@@ -947,35 +957,81 @@ def _run_evaluate_transfer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_detect_model_from_local_onnx(args: argparse.Namespace) -> Baseline | None:
+    try:
+        model = load_onnx_baseline(args.onnx_model)
+    except (ValueError, OSError) as error:
+        print(str(error), file=sys.stderr)
+        return None
+    print(f"model loaded: {args.onnx_model} (ONNX)")
+    return model
+
+
+def _load_detect_model_from_registry_onnx(args: argparse.Namespace) -> Baseline | None:
+    if args.verify_key is None:
+        print("--onnx-model-name requires --verify-key", file=sys.stderr)
+        return None
+    registry = RegistryConfig(backend_url=args.backend_url)
+    try:
+        version = args.model_version or latest_version(registry, args.onnx_model_name)
+        onnx_bytes = load_onnx_model_from_registry(
+            registry, args.onnx_model_name, version, args.verify_key
+        )
+    except RegistryError as error:
+        print(str(error), file=sys.stderr)
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".onnx") as tmp:
+        tmp.write(onnx_bytes)
+        tmp.flush()
+        model = load_onnx_baseline(Path(tmp.name))
+    print(f"model loaded: {args.onnx_model_name}@{version} from {args.backend_url} (ONNX)")
+    return model
+
+
+def _load_detect_model_from_registry_joblib(args: argparse.Namespace) -> Baseline | None:
+    if args.verify_key is None:
+        print("--model-name requires --verify-key", file=sys.stderr)
+        return None
+    registry = RegistryConfig(backend_url=args.backend_url)
+    try:
+        version = args.model_version or latest_version(registry, args.model_name)
+        model = load_model_from_registry(registry, args.model_name, version, args.verify_key)
+    except RegistryError as error:
+        print(str(error), file=sys.stderr)
+        return None
+    print(f"model loaded: {args.model_name}@{version} from {args.backend_url}")
+    return model
+
+
+def _load_detect_model(args: argparse.Namespace) -> Baseline | None:
+    """Loads the model from whichever of --model-name/--onnx-model/
+    --onnx-model-name was given, printing an error and returning `None` on
+    any failure instead of raising — `_run_detect_run` turns that into its
+    own exit code."""
+    if args.onnx_model is not None:
+        return _load_detect_model_from_local_onnx(args)
+    if args.onnx_model_name is not None:
+        return _load_detect_model_from_registry_onnx(args)
+    return _load_detect_model_from_registry_joblib(args)
+
+
 def _run_detect_run(args: argparse.Namespace) -> int:
     # Without this, detector.py's logger.info (every detection, the
     # closing latency summary) is silently dropped — INFO is below the
     # logging module's default root level, and nothing else in this CLI
     # calls basicConfig since every other command only ever used print().
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    if (args.model_name is None) == (args.onnx_model is None):
-        print("exactly one of --model-name or --onnx-model is required", file=sys.stderr)
+    sources = (args.model_name, args.onnx_model, args.onnx_model_name)
+    if sum(source is not None for source in sources) != 1:
+        print(
+            "exactly one of --model-name, --onnx-model or --onnx-model-name is required",
+            file=sys.stderr,
+        )
         return 1
 
-    if args.onnx_model is not None:
-        try:
-            model: Baseline = load_onnx_baseline(args.onnx_model)
-        except (ValueError, OSError) as error:
-            print(str(error), file=sys.stderr)
-            return 1
-        print(f"model loaded: {args.onnx_model} (ONNX)")
-    else:
-        if args.verify_key is None:
-            print("--model-name requires --verify-key", file=sys.stderr)
-            return 1
-        registry = RegistryConfig(backend_url=args.backend_url)
-        try:
-            version = args.model_version or latest_version(registry, args.model_name)
-            model = load_model_from_registry(registry, args.model_name, version, args.verify_key)
-        except RegistryError as error:
-            print(str(error), file=sys.stderr)
-            return 1
-        print(f"model loaded: {args.model_name}@{version} from {args.backend_url}")
+    model = _load_detect_model(args)
+    if model is None:
+        return 1
 
     config = KafkaDetectorConfig(
         model=model,

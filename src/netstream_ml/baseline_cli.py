@@ -20,7 +20,13 @@ import polars as pl
 
 from netstream_ml.baselines import ClassificationMetrics
 from netstream_ml.detector import Baseline, save_model
-from netstream_ml.model_registry import ModelMetadata, RegistryConfig, RegistryError, publish_model
+from netstream_ml.model_registry import (
+    ModelMetadata,
+    RegistryConfig,
+    RegistryError,
+    publish_model,
+    upload_onnx_artifact,
+)
 from netstream_ml.onnx_export import run_onnx, save_onnx_model, to_onnx
 from netstream_ml.tracking import track_run
 
@@ -144,6 +150,24 @@ def _maybe_export_onnx(args: argparse.Namespace, model: Baseline, test: pl.DataF
 
     save_onnx_model(onnx_model, args.export_onnx)
     print(f"model exported to ONNX at {args.export_onnx}")
+
+    if args.register_model is not None:
+        registry = RegistryConfig(backend_url=args.backend_url)
+        try:
+            upload_onnx_artifact(
+                registry,
+                args.register_model,
+                args.model_version,
+                args.export_onnx,
+                args.signing_key,
+            )
+        except RegistryError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(
+            f"onnx artifact registered: {args.register_model}@{args.model_version} "
+            f"({args.backend_url})"
+        )
     return 0
 
 
