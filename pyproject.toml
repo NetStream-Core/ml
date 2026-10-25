@@ -18,6 +18,7 @@ dependencies = [
     "onnxmltools>=1.16.0",
     "onnxruntime>=1.31.0",
     "cryptography>=50.0.1",
+    "boto3>=1.40.0",
 ]
 
 [project.scripts]
